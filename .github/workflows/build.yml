@@ -6,7 +6,7 @@ on:
       target:
         default: 'bk7251'
       version:
-        default: '0.3.0'
+        default: '0.4.0'
 
 jobs:
   build:
@@ -31,38 +31,56 @@ jobs:
           tail -3 ../patch.log
           find . -name '*.rej' | head
 
-      - name: Enable BKCAM only for BK7252, fix Makefile, disable SDCARD
+      - name: Configure for BK7252U
         run: |
           cd obk
           python3 - <<'PY'
-          p='src/obk_config.h'
-          L=open(p).read().split('\n')
-          done=[]
+          import re, os
+          cfg='src/obk_config.h'
+
+          # 1) включаем драйвер камеры ТОЛЬКО в том блоке, где ENABLE_DRIVER_BKCAM
+          L=open(cfg).read().split('\n'); done=[]
           for i,l in enumerate(L):
-              if l.strip()=='#if PLATFORM_BK7252N':
-                  if 'ENABLE_DRIVER_BKCAM' in '\n'.join(L[i:i+12]):
-                      L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'
-                      done.append(i+1)
-          open(p,'w').write('\n'.join(L))
-          print('BKCAM guard patched at lines:', done)
+              if l.strip()=='#if PLATFORM_BK7252N' and 'ENABLE_DRIVER_BKCAM' in '\n'.join(L[i:i+12]):
+                  L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'; done.append(i+1)
+          open(cfg,'w').write('\n'.join(L))
+          print('BKCAM guard patched at:', done)
+
+          def force_off(macro):
+              s=open(cfg).read(); i=s.rfind('#endif')
+              s=s[:i]+'\n#undef %s\n#define %s 0\n'%(macro,macro)+s[i:]
+              open(cfg,'w').write(s); print('FORCED OFF:', macro)
+
+          # 2) гасим периферию, которой у BK7252U физически нет
+          for p in ['src/driver/drv_bkCharge.c']:
+              if not os.path.exists(p): print('missing', p); continue
+              for l in open(p).read().split('\n'):
+                  t=l.strip()
+                  if t.startswith('#if'):
+                      print(p, '-> guard:', t)
+                      m=re.fullmatch(r'#if\s+(ENABLE_[A-Z0-9_]+)', t)
+                      if m: force_off(m.group(1))
+                      else: print('!! complex guard, needs manual fix:', t)
+                      break
           PY
-          # принудительно гасим SD-карту, если где-то включена
-          sed -i -E 's/^([[:space:]]*#define[[:space:]]+ENABLE_DRIVER_SDCARD[A-Z_]*[[:space:]]+)1/\10/' src/obk_config.h
-          # сломанный ifeq в SDK
+          # 3) сломанный ifeq в SDK
           sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
-          echo "--- guards ---"; grep -n 'PLATFORM_BK7252N' src/obk_config.h
-          echo "--- sdcard ---"; grep -n -i 'sdcard' src/obk_config.h || echo none
-          echo "--- camera_intf make ---"; grep -n 'CFG_USE_CAMERA_INTF' sdk/beken_freertos_sdk/beken378/beken_src.mk
+          echo "--- BKSDCARD / BKCHARGE / BKCAM in config ---"
+          grep -n 'BKSDCARD\|BKCHARGE\|BKCAM' src/obk_config.h
 
       - name: Diagnostics
         run: |
           mkdir -p diag
           cd obk
-          { echo "=== drv_sdcard.c head ==="; head -20 src/driver/drv_sdcard.c
-            echo "=== drv_sdcard_fs.c head ==="; head -20 src/driver/drv_sdcard_fs.c
-            echo "=== sdcard in obk_main.mk ==="; grep -n -i 'sdcard\|sd_card' platforms/obk_main.mk || echo none
-            echo "=== sd_card.h location ==="; find sdk/beken_freertos_sdk -name 'sd_card.h' || echo "NOT in SDK"
-            echo "=== obk_config.h 300-400 ==="; sed -n '300,400p' src/obk_config.h
+          { echo "=== guards of beken-specific drivers ==="
+            for f in src/driver/drv_bk*.c src/driver/drv_sdcard*.c; do
+              [ -f "$f" ] || continue
+              echo "--- $f"; grep -m2 -n '^#if' "$f" || echo "(no #if)"
+            done
+            echo "=== BKCharge references outside its own file ==="
+            grep -rn 'BKCharge' src --include=*.c --include=*.h | grep -v 'drv_bkCharge.c' || echo none
+            echo "=== tail of obk_config.h ==="
+            tail -25 src/obk_config.h
           } > ../diag/guards.txt 2>&1
           cat ../diag/guards.txt
 
@@ -91,8 +109,8 @@ jobs:
             > $GITHUB_WORKSPACE/build.log 2>&1 || true
           echo "===== ERRORS ====="
           grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|not exist' $GITHUB_WORKSPACE/build.log | head -40 || true
-          echo "===== last 60 ====="
-          tail -60 $GITHUB_WORKSPACE/build.log
+          echo "===== last 40 ====="
+          tail -40 $GITHUB_WORKSPACE/build.log
           echo "===== out ====="
           ls -la out/*.bin out/*.rbl 2>/dev/null || echo "no images"
 
