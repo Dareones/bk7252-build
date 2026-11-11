@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        default: '0.5.0'
+        default: '0.6.0'
 
 jobs:
   build:
@@ -22,20 +22,39 @@ jobs:
           git submodule update --init --depth 1 sdk/beken_freertos_sdk libraries/berry
           git clone -q https://github.com/pingwiner/bk7252n-camera.git ../cam
 
-      - name: Official prebuild (toolchain, berry, pre_build_7252.sh)
+      - name: Official prebuild
         run: |
           cd obk
           make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
-          tail -30 ../prebuild.log
-          echo "--- pre_build_7252.sh ---"
-          cat platforms/BK723x/pre_build_7252.sh 2>/dev/null || echo "not present"
+          tail -20 ../prebuild.log
 
-      - name: Apply camera patch + BK7252U config
+      - name: Apply camera patch
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
           tail -3 ../patch.log
-          find . -name '*.rej' | head
+
+      - name: Show and revert early-boot SDK changes
+        run: |
+          cd obk/sdk/beken_freertos_sdk
+          { echo "########## arch_main.c ##########"
+            git diff -- beken378/driver/entry/arch_main.c
+            echo "########## uart.c ##########"
+            git diff -- beken378/driver/uart/uart.c
+            echo "########## param_config.c ##########"
+            git diff -- beken378/app/config/param_config.c
+          } > ../../../diag_early.txt 2>&1
+          head -150 ../../../diag_early.txt
+          # возвращаем оригинал: эти правки написаны под BK7252N
+          git checkout -- beken378/driver/entry/arch_main.c \
+                          beken378/driver/uart/uart.c \
+                          beken378/app/config/param_config.c
+          echo "=== remaining SDK changes (should be camera only) ==="
+          git status --short
+
+      - name: BK7252U config
+        run: |
+          cd obk
           python3 - <<'PY'
           import re, os
           cfg='src/obk_config.h'
@@ -59,33 +78,27 @@ jobs:
                       break
           PY
           sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
-          grep -n 'CFG_USE_CAMERA_INTF' sdk/beken_freertos_sdk/beken378/beken_src.mk
           printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > src/driver/drv_bkCam_version.h
 
-      - name: Build via official OpenBK7252 target
+      - name: Build
         continue-on-error: true
         run: |
           cd obk
           make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
             > ../build.log 2>&1 || true
           echo "===== ERRORS ====="
-          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|not exist\|No rule' ../build.log | head -40 || true
-          echo "===== last 50 ====="
-          tail -50 ../build.log
-          echo "===== output ====="
-          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "no output dir"
+          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -40 || true
+          echo "===== last 30 ====="
+          tail -30 ../build.log
+          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "no output"
 
       - name: Collect
         if: always()
         run: |
           mkdir -p result
-          cp build.log patch.log prebuild.log result/ 2>/dev/null || true
+          cp build.log patch.log prebuild.log diag_early.txt result/ 2>/dev/null || true
           cp -r obk/output/* result/ 2>/dev/null || true
-          for f in obk/sdk/beken_freertos_sdk/out/bk7251_UA.bin obk/sdk/beken_freertos_sdk/out/app.rbl; do
-            [ -f "$f" ] && cp "$f" result/ && echo "GOT: $f"
-          done
-          find result -name '*.bin' -o -name '*.rbl' | head -30
-          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head -30
+          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head -20
 
       - name: Upload
         if: always()
