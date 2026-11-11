@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        default: '0.6.0'
+        default: '0.7.0'
 
 jobs:
   build:
@@ -26,7 +26,7 @@ jobs:
         run: |
           cd obk
           make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
-          tail -20 ../prebuild.log
+          tail -10 ../prebuild.log
 
       - name: Apply camera patch
         run: |
@@ -34,22 +34,19 @@ jobs:
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
           tail -3 ../patch.log
 
-      - name: Show and revert early-boot SDK changes
+      - name: Revert N-only SDK changes, keep UART2 console
         run: |
           cd obk/sdk/beken_freertos_sdk
-          { echo "########## arch_main.c ##########"
-            git diff -- beken378/driver/entry/arch_main.c
-            echo "########## uart.c ##########"
-            git diff -- beken378/driver/uart/uart.c
-            echo "########## param_config.c ##########"
-            git diff -- beken378/app/config/param_config.c
-          } > ../../../diag_early.txt 2>&1
-          head -150 ../../../diag_early.txt
-          # возвращаем оригинал: эти правки написаны под BK7252N
           git checkout -- beken378/driver/entry/arch_main.c \
                           beken378/driver/uart/uart.c \
                           beken378/app/config/param_config.c
-          echo "=== remaining SDK changes (should be camera only) ==="
+          # возвращаем ТОЛЬКО определение переменной (нужно drv_bkCam.c), без N-логики кнопки
+          sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = -1;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
+          echo "--- g_power_btn_hold_ms ---"
+          grep -n 'g_power_btn_hold_ms' beken378/driver/entry/arch_main.c
+          echo "--- console port (must be UART2) ---"
+          grep -n 'int uart_print_port' beken378/driver/uart/uart.c
+          echo "--- remaining SDK changes ---"
           git status --short
 
       - name: BK7252U config
@@ -87,16 +84,16 @@ jobs:
           make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
             > ../build.log 2>&1 || true
           echo "===== ERRORS ====="
-          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -40 || true
-          echo "===== last 30 ====="
-          tail -30 ../build.log
+          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -30 || true
+          echo "===== last 20 ====="
+          tail -20 ../build.log
           ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "no output"
 
       - name: Collect
         if: always()
         run: |
           mkdir -p result
-          cp build.log patch.log prebuild.log diag_early.txt result/ 2>/dev/null || true
+          cp build.log patch.log prebuild.log result/ 2>/dev/null || true
           cp -r obk/output/* result/ 2>/dev/null || true
           find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head -20
 
