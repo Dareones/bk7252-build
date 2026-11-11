@@ -4,10 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'SDK target'
         default: 'bk7251'
       version:
-        default: '0.2.0'
+        default: '0.3.0'
 
 jobs:
   build:
@@ -29,31 +28,43 @@ jobs:
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
-          tail -5 ../patch.log
+          tail -3 ../patch.log
           find . -name '*.rej' | head
 
-      - name: Enable camera for BK7252 (U) and fix Makefile bug
+      - name: Enable BKCAM only for BK7252, fix Makefile, disable SDCARD
         run: |
           cd obk
-          # драйвер камеры был включён только для PLATFORM_BK7252N
-          sed -i 's/^#if PLATFORM_BK7252N$/#if PLATFORM_BK7252N || PLATFORM_BK7252/' src/obk_config.h
-          grep -n 'PLATFORM_BK7252N || PLATFORM_BK7252' src/obk_config.h || echo "WARN: guard not patched"
-          # сломанный ifeq в SDK: из-за него camera_intf.c не компилировался
+          python3 - <<'PY'
+          p='src/obk_config.h'
+          L=open(p).read().split('\n')
+          done=[]
+          for i,l in enumerate(L):
+              if l.strip()=='#if PLATFORM_BK7252N':
+                  if 'ENABLE_DRIVER_BKCAM' in '\n'.join(L[i:i+12]):
+                      L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'
+                      done.append(i+1)
+          open(p,'w').write('\n'.join(L))
+          print('BKCAM guard patched at lines:', done)
+          PY
+          # принудительно гасим SD-карту, если где-то включена
+          sed -i -E 's/^([[:space:]]*#define[[:space:]]+ENABLE_DRIVER_SDCARD[A-Z_]*[[:space:]]+)1/\10/' src/obk_config.h
+          # сломанный ifeq в SDK
           sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
-          grep -n 'CFG_USE_CAMERA_INTF' sdk/beken_freertos_sdk/beken378/beken_src.mk
+          echo "--- guards ---"; grep -n 'PLATFORM_BK7252N' src/obk_config.h
+          echo "--- sdcard ---"; grep -n -i 'sdcard' src/obk_config.h || echo none
+          echo "--- camera_intf make ---"; grep -n 'CFG_USE_CAMERA_INTF' sdk/beken_freertos_sdk/beken378/beken_src.mk
 
       - name: Diagnostics
         run: |
           mkdir -p diag
-          cd obk/sdk/beken_freertos_sdk
-          echo "===== available targets =====" | tee ../../../diag/targets.txt
-          ls beken378/app/config/sys_config_*.h | tee -a ../../../diag/targets.txt
-          echo "===== CFG_SOC_NAME per config =====" | tee ../../../diag/soc_names.txt
-          grep -H 'define CFG_SOC_NAME' beken378/app/config/sys_config_*.h | tee -a ../../../diag/soc_names.txt
-          echo "===== generate_sys_config.sh =====" | tee ../../../diag/gen_cfg.txt
-          cat tools/scripts/generate_sys_config.sh | tee -a ../../../diag/gen_cfg.txt
-          echo "===== camera flags in candidate configs =====" | tee ../../../diag/cam_flags.txt
-          grep -H -n 'CAMERA_INTF\|CFG_SOC_NAME\|SOC_BK' beken378/app/config/sys_config_bk7251.h | tee -a ../../../diag/cam_flags.txt
+          cd obk
+          { echo "=== drv_sdcard.c head ==="; head -20 src/driver/drv_sdcard.c
+            echo "=== drv_sdcard_fs.c head ==="; head -20 src/driver/drv_sdcard_fs.c
+            echo "=== sdcard in obk_main.mk ==="; grep -n -i 'sdcard\|sd_card' platforms/obk_main.mk || echo none
+            echo "=== sd_card.h location ==="; find sdk/beken_freertos_sdk -name 'sd_card.h' || echo "NOT in SDK"
+            echo "=== obk_config.h 300-400 ==="; sed -n '300,400p' src/obk_config.h
+          } > ../diag/guards.txt 2>&1
+          cat ../diag/guards.txt
 
       - name: Toolchain + Berry
         run: |
@@ -68,7 +79,6 @@ jobs:
           mkdir -p libraries/berry/generate
           python3 ./libraries/berry/tools/coc/coc -o libraries/berry/generate \
             libraries/berry/src src/berry/modules -c include/berry_conf.h
-          ls libraries/berry/generate | head
 
       - name: Build
         continue-on-error: true
@@ -79,24 +89,22 @@ jobs:
           ARM_GCC_TOOLCHAIN="$SDK/toolchain/arm-none-eabi/bin/" \
             sh build.sh ${{ github.event.inputs.target }} ${{ github.event.inputs.version }} \
             > $GITHUB_WORKSPACE/build.log 2>&1 || true
-          echo "===== last 80 lines ====="
-          tail -80 $GITHUB_WORKSPACE/build.log
-          echo "===== errors ====="
-          grep -n -i 'error\|not exist\|No rule\|undefined reference' $GITHUB_WORKSPACE/build.log | head -40 || true
+          echo "===== ERRORS ====="
+          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|not exist' $GITHUB_WORKSPACE/build.log | head -40 || true
+          echo "===== last 60 ====="
+          tail -60 $GITHUB_WORKSPACE/build.log
           echo "===== out ====="
-          ls -la out/ 2>/dev/null || echo "no out dir"
+          ls -la out/*.bin out/*.rbl 2>/dev/null || echo "no images"
 
       - name: Collect
         if: always()
         run: |
           mkdir -p result
-          cp build.log result/ 2>/dev/null || true
-          cp patch.log result/ 2>/dev/null || true
+          cp build.log patch.log result/ 2>/dev/null || true
           for f in obk/sdk/beken_freertos_sdk/out/*.bin obk/sdk/beken_freertos_sdk/out/*.rbl; do
             [ -f "$f" ] && cp "$f" result/ && echo "GOT: $f"
           done
           ls -la result/
-          echo "===== SIZES ====="
           find result -name '*.bin' -printf '%s %p\n' 2>/dev/null || true
 
       - name: Upload
