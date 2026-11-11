@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        default: '0.9.0'
+        default: '0.10.0'
 
 jobs:
   build:
@@ -26,13 +26,11 @@ jobs:
         run: |
           cd obk
           make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
-          tail -10 ../prebuild.log
 
       - name: Apply camera patch
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
-          tail -3 ../patch.log
 
       - name: Revert N-only SDK changes
         run: |
@@ -41,10 +39,65 @@ jobs:
                           beken378/driver/uart/uart.c \
                           beken378/app/config/param_config.c
           sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = 2000;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
-          echo "--- hold value ---"
-          grep -n 'g_power_btn_hold_ms' beken378/driver/entry/arch_main.c
-          echo "--- console port ---"
-          grep -n 'int uart_print_port' beken378/driver/uart/uart.c
+
+      - name: Find and add pin mux for I2C1
+        run: |
+          cd obk/sdk/beken_freertos_sdk
+          echo "===== searching for gpio_filter / pin mux ====="
+          grep -rn 'gpio_filter\|GPIO_FILTER\|JTAG' beken378/driver/gpio/ beken378/func/ --include='*.c' --include='*.h' | head -30 > ../../../diag_pinmux.txt || true
+          echo "===== i2c1_open implementation ====="
+          grep -rn 'i2c1_open\|void i2c1' beken378/ --include='*.c' --include='*.h' | head -20 >> ../../../diag_pinmux.txt || true
+          cat ../../../diag_pinmux.txt
+          echo "===== adding pin mux to camera_intf.c ====="
+          # Найдём, где вызывается i2c1_open, и добавим pin mux перед ним
+          grep -n 'i2c1_open\|I2C1' beken378/func/camera_intf/camera_intf.c | head -10
+
+      - name: Add pin mux before I2C1 open
+        run: |
+          cd obk/sdk/beken_freertos_sdk
+          # Добавим вызов освобождения пинов из JTAG перед открытием I2C1
+          # Из логов видно: [JTAG]gpio_filter_20, gpio_filter_21
+          # Это функции gpio_set_func или подобные
+          python3 - <<'PY'
+          import re
+          p='beken378/func/camera_intf/camera_intf.c'
+          with open(p) as f:
+              content = f.read()
+          
+          # Найдём место перед i2c1_open или I2C init
+          # Добавим вызов освобождения пинов GPIO20/21 из JTAG
+          pin_mux_code = '''
+    // Release GPIO20/21 from JTAG for I2C1 (observed in factory log)
+    extern void gpio_filter_20(void);
+    extern void gpio_filter_21(void);
+    gpio_filter_20();
+    gpio_filter_21();
+'''
+          
+          # Ищем место перед первым обращением к I2C
+          if 'i2c1_open' in content or 'I2C1' in content:
+              # Найдём функцию camera_intfer_init или подобную
+              pattern = r'(void\s+camera_intfer_init\s*\([^)]*\)\s*\{)'
+              match = re.search(pattern, content)
+              if match:
+                  insert_pos = match.end()
+                  content = content[:insert_pos] + pin_mux_code + content[insert_pos:]
+                  print("Added pin mux after camera_intfer_init")
+              else:
+                  # Если не нашли camera_intfer_init, добавим в начало файла после includes
+                  pattern = r'(#endif\s*//\s*__CAMERA_INTF_H__)'
+                  match = re.search(pattern, content)
+                  if match:
+                      insert_pos = match.end()
+                      content = content[:insert_pos] + '\n' + pin_mux_code + content[insert_pos:]
+                      print("Added pin mux after header guard")
+          
+          with open(p, 'w') as f:
+              f.write(content)
+          print("Modified camera_intf.c")
+          PY
+          echo "===== first 80 lines of camera_intf.c ====="
+          head -80 beken378/func/camera_intf/camera_intf.c
 
       - name: BK7252U config
         run: |
@@ -84,50 +137,19 @@ jobs:
           grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -30 || true
           echo "===== last 20 ====="
           tail -20 ../build.log
-          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "no output"
-
-      - name: Resolve crash addresses
-        run: |
-          cd obk/sdk/beken_freertos_sdk
-          TC=toolchain/arm-none-eabi/bin
-          ELF=$(ls out/*.elf 2>/dev/null | head -1)
-          echo "ELF: $ELF"
-          echo "===== addr2line (LR from crash log) ====="
-          $TC/arm-none-eabi-addr2line -f -C -e "$ELF" 0x14F64 0x14F84 || true
-          echo "===== enclosing symbols ====="
-          $TC/arm-none-eabi-nm -n "$ELF" > /tmp/syms.txt || true
-          python3 - <<'PY'
-          addrs=[0x14F64, 0x14F84]
-          syms=[]
-          for line in open('/tmp/syms.txt'):
-              p=line.split()
-              if len(p)>=3:
-                  try: syms.append((int(p[0],16), p[1], p[2]))
-                  except ValueError: pass
-          syms.sort()
-          for a in addrs:
-              best=None
-              for s in syms:
-                  if s[0]<=a: best=s
-                  else: break
-              print(hex(a), '->', best)
-          PY
-          echo "===== i2c / jtag / camera symbols present ====="
-          $TC/arm-none-eabi-nm "$ELF" | grep -i 'i2c\|jtag\|gpio_filter\|camera_intf\|gc0329' | head -40 || true
 
       - name: Collect
         if: always()
         run: |
           mkdir -p result
-          cp build.log patch.log prebuild.log result/ 2>/dev/null || true
+          cp build.log patch.log prebuild.log diag_pinmux.txt result/ 2>/dev/null || true
           cp -r obk/output/* result/ 2>/dev/null || true
-          cp obk/sdk/beken_freertos_sdk/out/*.map result/ 2>/dev/null || true
           find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-crashmap
+          name: bk7252-build
           path: result/
           if-no-files-found: warn
