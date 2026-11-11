@@ -26,13 +26,11 @@ jobs:
         run: |
           cd obk
           make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
-          tail -10 ../prebuild.log
 
       - name: Apply camera patch
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
-          tail -3 ../patch.log
 
       - name: Revert N-only SDK changes
         run: |
@@ -40,12 +38,7 @@ jobs:
           git checkout -- beken378/driver/entry/arch_main.c \
                           beken378/driver/uart/uart.c \
                           beken378/app/config/param_config.c
-          # «кнопку держали 2 секунды» -> драйвер BKCam НЕ уходит в deep sleep
           sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = 2000;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
-          echo "--- hold value ---"
-          grep -n 'g_power_btn_hold_ms' beken378/driver/entry/arch_main.c
-          echo "--- console port (must be UART2) ---"
-          grep -n 'int uart_print_port' beken378/driver/uart/uart.c
 
       - name: BK7252U config
         run: |
@@ -76,16 +69,23 @@ jobs:
           printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > src/driver/drv_bkCam_version.h
 
       - name: Build
-        continue-on-error: true
         run: |
           cd obk
-          make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
-            > ../build.log 2>&1 || true
-          echo "===== ERRORS ====="
-          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -30 || true
-          echo "===== last 20 ====="
-          tail -20 ../build.log
-          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "no output"
+          make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 > ../build.log 2>&1 || true
+          tail -5 ../build.log
+
+      - name: Resolve crash addresses
+        run: |
+          cd obk/sdk/beken_freertos_sdk
+          TC=toolchain/arm-none-eabi/bin
+          ELF=$(ls out/*.elf 2>/dev/null | head -1)
+          echo "ELF: $ELF"
+          echo "===== addr2line for observed LR values ====="
+          $TC/arm-none-eabi-addr2line -f -C -e "$ELF" 0x14F64 0x14F84 0x14F00 0x15000 || true
+          echo "===== nm around 0x14F00-0x15100 ====="
+          $TC/arm-none-eabi-nm -n "$ELF" | awk 'strtonum("0x"$1)>=0x14E00 && strtonum("0x"$1)<=0x15200' || true
+          echo "===== i2c / jtag / pin-mux symbols ====="
+          $TC/arm-none-eabi-nm "$ELF" | grep -i 'i2c\|jtag\|gpio_filter' | head -40 || true
 
       - name: Collect
         if: always()
@@ -93,12 +93,13 @@ jobs:
           mkdir -p result
           cp build.log patch.log prebuild.log result/ 2>/dev/null || true
           cp -r obk/output/* result/ 2>/dev/null || true
-          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head -20
+          cp obk/sdk/beken_freertos_sdk/out/*.map result/ 2>/dev/null || true
+          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head
 
       - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-build
+          name: bk7252-crashmap
           path: result/
           if-no-files-found: warn
