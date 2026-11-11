@@ -4,117 +4,106 @@ on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'SDK target (bk7252 = U, bk7252n = N)'
-        default: 'bk7252'
+        description: 'SDK target'
+        default: 'bk7251'
       version:
-        description: 'Version string'
-        default: '0.1.0'
+        default: '0.2.0'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Install dependencies
+      - name: Deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y build-essential python3 python3-pip patch xz-utils make git || true
-          sudo apt-get install -y libc6-i386 lib32z1 lib32stdc++6 || true
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential python3 patch xz-utils make git libc6-i386 lib32z1 lib32stdc++6
 
-      - name: Clone OpenBeken (pinned)
+      - name: Clone pinned sources
         run: |
-          git clone https://github.com/openshwprojects/OpenBK7231T_App.git obk
-          cd obk
-          git checkout 168cba55
-          git submodule update --init sdk/beken_freertos_sdk libraries/berry
-          cd sdk/beken_freertos_sdk
-          git checkout f5a64d4
-          cd ../../..
-          echo "=== OBK HEAD ==="; git -C obk log -1 --oneline
-          echo "=== SDK HEAD ==="; git -C obk/sdk/beken_freertos_sdk log -1 --oneline
+          git clone -q https://github.com/openshwprojects/OpenBK7231T_App.git obk
+          cd obk && git checkout -q 168cba55
+          git submodule update --init --depth 1 sdk/beken_freertos_sdk libraries/berry
+          git clone -q https://github.com/pingwiner/bk7252n-camera.git ../cam
 
-      - name: Clone camera patch repo
-        run: git clone https://github.com/pingwiner/bk7252n-camera.git cam
-
-      - name: Apply patch
+      - name: Apply camera patch
         run: |
           cd obk
-          patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || echo "patch returned nonzero"
-          cd ..
-          echo "===== PATCH LOG ====="; cat patch.log || true
-          echo "===== REJECTS ====="
-          find obk -name '*.rej' | while read f; do echo "--- $f"; cat "$f"; done || true
+          patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
+          tail -5 ../patch.log
+          find . -name '*.rej' | head
 
-      - name: Collect diagnostics
+      - name: Enable camera for BK7252 (U) and fix Makefile bug
+        run: |
+          cd obk
+          # драйвер камеры был включён только для PLATFORM_BK7252N
+          sed -i 's/^#if PLATFORM_BK7252N$/#if PLATFORM_BK7252N || PLATFORM_BK7252/' src/obk_config.h
+          grep -n 'PLATFORM_BK7252N || PLATFORM_BK7252' src/obk_config.h || echo "WARN: guard not patched"
+          # сломанный ifeq в SDK: из-за него camera_intf.c не компилировался
+          sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
+          grep -n 'CFG_USE_CAMERA_INTF' sdk/beken_freertos_sdk/beken378/beken_src.mk
+
+      - name: Diagnostics
         run: |
           mkdir -p diag
-          cp patch.log diag/ 2>/dev/null || true
-          find obk -name '*.rej' -exec cp {} diag/ \; 2>/dev/null || true
-          cp cam/openbk-port/build_camera_fw.sh diag/ 2>/dev/null || true
-          cp cam/openbk-port/docker_build.sh diag/ 2>/dev/null || true
-          cp cam/openbk-port/Dockerfile diag/ 2>/dev/null || true
-          echo "===== build_camera_fw.sh ====="; cat cam/openbk-port/build_camera_fw.sh || true
-          echo "===== obk_config.h : BK7252 / BKCAM ====="
-          find obk -name 'obk_config*' | tee diag/obk_config_paths.txt
-          find obk -name 'obk_config*' -exec grep -n -i 'bk7252\|BKCAM\|MDNS\|TCP_COMMANDLINE' {} + | tee diag/obk_config_grep.txt || true
-          echo "===== CFG_USE_CAMERA_INTF ====="
-          grep -rn 'CFG_USE_CAMERA_INTF' obk/sdk/beken_freertos_sdk --include='*.mk' --include='Makefile*' --include='*.h' | tee diag/camera_intf_flag.txt || true
-          echo "===== camera_intf dir ====="
-          find obk/sdk/beken_freertos_sdk -path '*camera_intf*' | tee diag/camera_intf_files.txt || true
-          echo "===== camera_intf Makefile ====="
-          find obk/sdk/beken_freertos_sdk -path '*camera_intf*' -name 'Makefile*' -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \; | tee diag/camera_intf_makefile.txt || true
-          echo "===== camera_intf_config.h ====="
-          find obk/sdk/beken_freertos_sdk -name 'camera_intf_config.h' -exec cat {} \; | tee diag/camera_intf_config.txt || true
-          echo "===== toolchain ====="
-          ls -la obk/sdk/beken_freertos_sdk/toolchain/ | tee diag/toolchain_ls.txt || true
-          echo "===== berry ====="
-          ls -la obk/libraries/berry/ | tee diag/berry_ls.txt || true
-          ls -la obk/libraries/berry/generate/ 2>/dev/null | tee -a diag/berry_ls.txt || true
-          echo "===== build.sh targets ====="
-          find obk/sdk/beken_freertos_sdk -maxdepth 2 -name 'build.sh' -exec sh -c 'echo "--- $1"; head -80 "$1"' _ {} \; | tee diag/build_sh_head.txt || true
-
-      - name: Unpack toolchain
-        run: |
-          mkdir -p tc
-          TC=$(find obk/sdk/beken_freertos_sdk/toolchain -name '*arm-none-eabi*.tar.xz' | head -1)
-          echo "toolchain archive: $TC"
-          tar -xf "$TC" -C tc
-          BIN=$(find tc -type d -name bin | head -1)
-          echo "$PWD/$BIN" >> $GITHUB_PATH
-          "$PWD/$BIN/arm-none-eabi-gcc" --version || true
-
-      - name: Generate Berry sources
-        continue-on-error: true
-        run: |
-          cd obk/libraries/berry
-          if [ -f generate.py ]; then python3 generate.py; \
-          elif [ -d generate ]; then (cd generate && make) || python3 ../generate/*.py || true; \
-          fi
-          ls -la
-
-      - name: Build firmware
-        continue-on-error: true
-        run: |
           cd obk/sdk/beken_freertos_sdk
-          sh build.sh ${{ github.event.inputs.target }} ${{ github.event.inputs.version }} 2>&1 | tee ../../../build.log
-          echo "===== OUT ====="
-          ls -la out/ | tee -a ../../../build.log || true
+          echo "===== available targets =====" | tee ../../../diag/targets.txt
+          ls beken378/app/config/sys_config_*.h | tee -a ../../../diag/targets.txt
+          echo "===== CFG_SOC_NAME per config =====" | tee ../../../diag/soc_names.txt
+          grep -H 'define CFG_SOC_NAME' beken378/app/config/sys_config_*.h | tee -a ../../../diag/soc_names.txt
+          echo "===== generate_sys_config.sh =====" | tee ../../../diag/gen_cfg.txt
+          cat tools/scripts/generate_sys_config.sh | tee -a ../../../diag/gen_cfg.txt
+          echo "===== camera flags in candidate configs =====" | tee ../../../diag/cam_flags.txt
+          grep -H -n 'CAMERA_INTF\|CFG_SOC_NAME\|SOC_BK' beken378/app/config/sys_config_bk7251.h | tee -a ../../../diag/cam_flags.txt
 
-      - name: Collect binaries
+      - name: Toolchain + Berry
+        run: |
+          SDK=$PWD/obk/sdk/beken_freertos_sdk
+          TC=$SDK/toolchain
+          mkdir -p $TC/.unpack
+          tar -C $TC/.unpack --no-same-owner --no-same-permissions -xJf $TC/arm-none-eabi-gcc.tar.xz
+          chmod -R u+w $TC/.unpack
+          mv $TC/.unpack/arm-none-eabi $TC/arm-none-eabi
+          $TC/arm-none-eabi/bin/arm-none-eabi-gcc --version | head -1
+          cd obk
+          mkdir -p libraries/berry/generate
+          python3 ./libraries/berry/tools/coc/coc -o libraries/berry/generate \
+            libraries/berry/src src/berry/modules -c include/berry_conf.h
+          ls libraries/berry/generate | head
+
+      - name: Build
+        continue-on-error: true
+        run: |
+          SDK=$PWD/obk/sdk/beken_freertos_sdk
+          printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > obk/src/driver/drv_bkCam_version.h
+          cd $SDK
+          ARM_GCC_TOOLCHAIN="$SDK/toolchain/arm-none-eabi/bin/" \
+            sh build.sh ${{ github.event.inputs.target }} ${{ github.event.inputs.version }} \
+            > $GITHUB_WORKSPACE/build.log 2>&1 || true
+          echo "===== last 80 lines ====="
+          tail -80 $GITHUB_WORKSPACE/build.log
+          echo "===== errors ====="
+          grep -n -i 'error\|not exist\|No rule\|undefined reference' $GITHUB_WORKSPACE/build.log | head -40 || true
+          echo "===== out ====="
+          ls -la out/ 2>/dev/null || echo "no out dir"
+
+      - name: Collect
         if: always()
         run: |
           mkdir -p result
-          find obk -name '*.bin' -newermt '-30 minutes' -exec cp {} result/ \; 2>/dev/null || true
-          find obk -name '*.rbl' -exec cp {} result/ \; 2>/dev/null || true
           cp build.log result/ 2>/dev/null || true
-          ls -la result/ || true
+          cp patch.log result/ 2>/dev/null || true
+          for f in obk/sdk/beken_freertos_sdk/out/*.bin obk/sdk/beken_freertos_sdk/out/*.rbl; do
+            [ -f "$f" ] && cp "$f" result/ && echo "GOT: $f"
+          done
+          ls -la result/
           echo "===== SIZES ====="
-          find result -name '*.bin' -exec ls -l {} \; || true
+          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null || true
 
-      - name: Upload everything
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-build-output
+          name: bk7252-build
           path: |
             result/
             diag/
