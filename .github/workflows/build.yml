@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        default: '0.7.0'
+        default: '0.8.0'
 
 jobs:
   build:
@@ -40,16 +40,13 @@ jobs:
           git checkout -- beken378/driver/entry/arch_main.c \
                           beken378/driver/uart/uart.c \
                           beken378/app/config/param_config.c
-          # возвращаем ТОЛЬКО определение переменной (нужно drv_bkCam.c), без N-логики кнопки
           sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = -1;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
           echo "--- g_power_btn_hold_ms ---"
           grep -n 'g_power_btn_hold_ms' beken378/driver/entry/arch_main.c
-          echo "--- console port (must be UART2) ---"
+          echo "--- console port ---"
           grep -n 'int uart_print_port' beken378/driver/uart/uart.c
-          echo "--- remaining SDK changes ---"
-          git status --short
 
-      - name: BK7252U config
+      - name: BK7252U config + disable Power driver
         run: |
           cd obk
           python3 - <<'PY'
@@ -65,7 +62,8 @@ jobs:
               s=open(cfg).read(); i=s.rfind('#endif')
               open(cfg,'w').write(s[:i]+'\n#undef %s\n#define %s 0\n'%(m,m)+s[i:])
               print('FORCED OFF:', m)
-          for p in ['src/driver/drv_bkCharge.c']:
+          # Отключаем драйверы, которых нет у BK7252U
+          for p in ['src/driver/drv_bkCharge.c', 'src/driver/drv_bkPower.c']:
               if not os.path.exists(p): continue
               for l in open(p).read().split('\n'):
                   t=l.strip()
@@ -76,6 +74,8 @@ jobs:
           PY
           sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
           printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > src/driver/drv_bkCam_version.h
+          echo "--- disabled drivers ---"
+          grep -n 'ENABLE_DRIVER_BKCHARGE\|ENABLE_DRIVER_BKPOWER' src/obk_config.h | tail -10
 
       - name: Build
         continue-on-error: true
