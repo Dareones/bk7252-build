@@ -1,0 +1,121 @@
+name: BK7252U camera build
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'SDK target (bk7252 = U, bk7252n = N)'
+        default: 'bk7252'
+      version:
+        description: 'Version string'
+        default: '0.1.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3 python3-pip patch xz-utils make git || true
+          sudo apt-get install -y libc6-i386 lib32z1 lib32stdc++6 || true
+
+      - name: Clone OpenBeken (pinned)
+        run: |
+          git clone https://github.com/openshwprojects/OpenBK7231T_App.git obk
+          cd obk
+          git checkout 168cba55
+          git submodule update --init sdk/beken_freertos_sdk libraries/berry
+          cd sdk/beken_freertos_sdk
+          git checkout f5a64d4
+          cd ../../..
+          echo "=== OBK HEAD ==="; git -C obk log -1 --oneline
+          echo "=== SDK HEAD ==="; git -C obk/sdk/beken_freertos_sdk log -1 --oneline
+
+      - name: Clone camera patch repo
+        run: git clone https://github.com/pingwiner/bk7252n-camera.git cam
+
+      - name: Apply patch
+        run: |
+          cd obk
+          patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || echo "patch returned nonzero"
+          cd ..
+          echo "===== PATCH LOG ====="; cat patch.log || true
+          echo "===== REJECTS ====="
+          find obk -name '*.rej' | while read f; do echo "--- $f"; cat "$f"; done || true
+
+      - name: Collect diagnostics
+        run: |
+          mkdir -p diag
+          cp patch.log diag/ 2>/dev/null || true
+          find obk -name '*.rej' -exec cp {} diag/ \; 2>/dev/null || true
+          cp cam/openbk-port/build_camera_fw.sh diag/ 2>/dev/null || true
+          cp cam/openbk-port/docker_build.sh diag/ 2>/dev/null || true
+          cp cam/openbk-port/Dockerfile diag/ 2>/dev/null || true
+          echo "===== build_camera_fw.sh ====="; cat cam/openbk-port/build_camera_fw.sh || true
+          echo "===== obk_config.h : BK7252 / BKCAM ====="
+          find obk -name 'obk_config*' | tee diag/obk_config_paths.txt
+          find obk -name 'obk_config*' -exec grep -n -i 'bk7252\|BKCAM\|MDNS\|TCP_COMMANDLINE' {} + | tee diag/obk_config_grep.txt || true
+          echo "===== CFG_USE_CAMERA_INTF ====="
+          grep -rn 'CFG_USE_CAMERA_INTF' obk/sdk/beken_freertos_sdk --include='*.mk' --include='Makefile*' --include='*.h' | tee diag/camera_intf_flag.txt || true
+          echo "===== camera_intf dir ====="
+          find obk/sdk/beken_freertos_sdk -path '*camera_intf*' | tee diag/camera_intf_files.txt || true
+          echo "===== camera_intf Makefile ====="
+          find obk/sdk/beken_freertos_sdk -path '*camera_intf*' -name 'Makefile*' -exec sh -c 'echo "--- $1"; cat "$1"' _ {} \; | tee diag/camera_intf_makefile.txt || true
+          echo "===== camera_intf_config.h ====="
+          find obk/sdk/beken_freertos_sdk -name 'camera_intf_config.h' -exec cat {} \; | tee diag/camera_intf_config.txt || true
+          echo "===== toolchain ====="
+          ls -la obk/sdk/beken_freertos_sdk/toolchain/ | tee diag/toolchain_ls.txt || true
+          echo "===== berry ====="
+          ls -la obk/libraries/berry/ | tee diag/berry_ls.txt || true
+          ls -la obk/libraries/berry/generate/ 2>/dev/null | tee -a diag/berry_ls.txt || true
+          echo "===== build.sh targets ====="
+          find obk/sdk/beken_freertos_sdk -maxdepth 2 -name 'build.sh' -exec sh -c 'echo "--- $1"; head -80 "$1"' _ {} \; | tee diag/build_sh_head.txt || true
+
+      - name: Unpack toolchain
+        run: |
+          mkdir -p tc
+          TC=$(find obk/sdk/beken_freertos_sdk/toolchain -name '*arm-none-eabi*.tar.xz' | head -1)
+          echo "toolchain archive: $TC"
+          tar -xf "$TC" -C tc
+          BIN=$(find tc -type d -name bin | head -1)
+          echo "$PWD/$BIN" >> $GITHUB_PATH
+          "$PWD/$BIN/arm-none-eabi-gcc" --version || true
+
+      - name: Generate Berry sources
+        continue-on-error: true
+        run: |
+          cd obk/libraries/berry
+          if [ -f generate.py ]; then python3 generate.py; \
+          elif [ -d generate ]; then (cd generate && make) || python3 ../generate/*.py || true; \
+          fi
+          ls -la
+
+      - name: Build firmware
+        continue-on-error: true
+        run: |
+          cd obk/sdk/beken_freertos_sdk
+          sh build.sh ${{ github.event.inputs.target }} ${{ github.event.inputs.version }} 2>&1 | tee ../../../build.log
+          echo "===== OUT ====="
+          ls -la out/ | tee -a ../../../build.log || true
+
+      - name: Collect binaries
+        if: always()
+        run: |
+          mkdir -p result
+          find obk -name '*.bin' -newermt '-30 minutes' -exec cp {} result/ \; 2>/dev/null || true
+          find obk -name '*.rbl' -exec cp {} result/ \; 2>/dev/null || true
+          cp build.log result/ 2>/dev/null || true
+          ls -la result/ || true
+          echo "===== SIZES ====="
+          find result -name '*.bin' -exec ls -l {} \; || true
+
+      - name: Upload everything
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bk7252-build-output
+          path: |
+            result/
+            diag/
+          if-no-files-found: warn
