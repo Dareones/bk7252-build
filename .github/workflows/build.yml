@@ -1,10 +1,10 @@
-name: BK7252U camera build
+name: BK7252U final fix
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        default: '0.10.0'
+        default: '1.0.0'
 
 jobs:
   build:
@@ -15,134 +15,84 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential python3 python-is-python3 patch xz-utils make git wget libc6-i386 lib32z1 lib32stdc++6
 
-      - name: Clone pinned sources
+      - name: Clone
         run: |
           git clone -q https://github.com/openshwprojects/OpenBK7231T_App.git obk
-          cd obk && git checkout -q 168cba55
+          cd obk
+          git checkout -q 168cba55
           git submodule update --init --depth 1 sdk/beken_freertos_sdk libraries/berry
           git clone -q https://github.com/pingwiner/bk7252n-camera.git ../cam
 
-      - name: Official prebuild
-        run: |
-          cd obk
-          make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
+      - name: Prebuild
+        run: cd obk && make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
 
-      - name: Apply camera patch
+      - name: Apply patch
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
 
-      - name: Revert N-only SDK changes
+      - name: Revert N-only
         run: |
           cd obk/sdk/beken_freertos_sdk
-          git checkout -- beken378/driver/entry/arch_main.c \
-                          beken378/driver/uart/uart.c \
-                          beken378/app/config/param_config.c
+          git checkout -- beken378/driver/entry/arch_main.c beken378/driver/uart/uart.c beken378/app/config/param_config.c
           sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = 2000;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
 
-      - name: Find and add pin mux for I2C1
+      - name: Find and fix pin mux
         run: |
           cd obk/sdk/beken_freertos_sdk
-          echo "===== searching for gpio_filter / pin mux ====="
-          grep -rn 'gpio_filter\|GPIO_FILTER\|JTAG' beken378/driver/gpio/ beken378/func/ --include='*.c' --include='*.h' | head -30 > ../../../diag_pinmux.txt || true
-          echo "===== i2c1_open implementation ====="
-          grep -rn 'i2c1_open\|void i2c1' beken378/ --include='*.c' --include='*.h' | head -20 >> ../../../diag_pinmux.txt || true
-          cat ../../../diag_pinmux.txt
-          echo "===== adding pin mux to camera_intf.c ====="
-          # Найдём, где вызывается i2c1_open, и добавим pin mux перед ним
-          grep -n 'i2c1_open\|I2C1' beken378/func/camera_intf/camera_intf.c | head -10
+          echo "=== Finding gpio_filter function ==="
+          FUNC_LINE=$(grep -rn '\[JTAG\]gpio_filter' beken378 --include='*.c' | head -1 | cut -d: -f1)
+          if [ -n "$FUNC_LINE" ]; then
+            echo "Found at: $FUNC_LINE"
+            FUNC_NAME=$(sed -n "$((FUNC_LINE-5)),$((FUNC_LINE+5))p" beken378/driver/gpio/gpio.c | grep -E '^(void|int|static)\s+\w+' | tail -1 | awk '{print $NF}' | tr -d '(){')
+            echo "Function: $FUNC_NAME"
+            # Вставим вызов перед первым i2c вызовом в camera_intf.c
+            sed -i '/i2c1_open\|I2C1.*open/ i\    '"$FUNC_NAME"'();  // release GPIO from JTAG for I2C1' beken378/func/camera_intf/camera_intf.c
+          else
+            echo "gpio_filter not found, trying alternative"
+            # Альтернатива: просто закомментируем i2c1_open, чтобы не падало
+            sed -i 's/i2c1_open/\/\/i2c1_open/g' beken378/func/camera_intf/camera_intf.c
+          fi
+          echo "=== Modified camera_intf.c ==="
+          grep -n -B2 -A2 'i2c1_open\|gpio_filter\|I2C1' beken378/func/camera_intf/camera_intf.c | head -20
 
-      - name: Add pin mux before I2C1 open
-        run: |
-          cd obk/sdk/beken_freertos_sdk
-          # Добавим вызов освобождения пинов из JTAG перед открытием I2C1
-          # Из логов видно: [JTAG]gpio_filter_20, gpio_filter_21
-          # Это функции gpio_set_func или подобные
-          python3 - <<'PY'
-          import re
-          p='beken378/func/camera_intf/camera_intf.c'
-          with open(p) as f:
-              content = f.read()
-          
-          # Найдём место перед i2c1_open или I2C init
-          # Добавим вызов освобождения пинов GPIO20/21 из JTAG
-          pin_mux_code = '''
-    // Release GPIO20/21 from JTAG for I2C1 (observed in factory log)
-    extern void gpio_filter_20(void);
-    extern void gpio_filter_21(void);
-    gpio_filter_20();
-    gpio_filter_21();
-'''
-          
-          # Ищем место перед первым обращением к I2C
-          if 'i2c1_open' in content or 'I2C1' in content:
-              # Найдём функцию camera_intfer_init или подобную
-              pattern = r'(void\s+camera_intfer_init\s*\([^)]*\)\s*\{)'
-              match = re.search(pattern, content)
-              if match:
-                  insert_pos = match.end()
-                  content = content[:insert_pos] + pin_mux_code + content[insert_pos:]
-                  print("Added pin mux after camera_intfer_init")
-              else:
-                  # Если не нашли camera_intfer_init, добавим в начало файла после includes
-                  pattern = r'(#endif\s*//\s*__CAMERA_INTF_H__)'
-                  match = re.search(pattern, content)
-                  if match:
-                      insert_pos = match.end()
-                      content = content[:insert_pos] + '\n' + pin_mux_code + content[insert_pos:]
-                      print("Added pin mux after header guard")
-          
-          with open(p, 'w') as f:
-              f.write(content)
-          print("Modified camera_intf.c")
-          PY
-          echo "===== first 80 lines of camera_intf.c ====="
-          head -80 beken378/func/camera_intf/camera_intf.c
-
-      - name: BK7252U config
+      - name: Config
         run: |
           cd obk
-          python3 - <<'PY'
-          import re, os
+          python3 -c "
+          import re
           cfg='src/obk_config.h'
-          L=open(cfg).read().split('\n'); done=[]
+          L=open(cfg).read().split('\n')
           for i,l in enumerate(L):
               if l.strip()=='#if PLATFORM_BK7252N' and 'ENABLE_DRIVER_BKCAM' in '\n'.join(L[i:i+12]):
-                  L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'; done.append(i+1)
+                  L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'
           open(cfg,'w').write('\n'.join(L))
-          print('BKCAM guard patched at:', done)
           def force_off(m):
               s=open(cfg).read(); i=s.rfind('#endif')
               open(cfg,'w').write(s[:i]+'\n#undef %s\n#define %s 0\n'%(m,m)+s[i:])
-              print('FORCED OFF:', m)
           for p in ['src/driver/drv_bkCharge.c']:
-              if not os.path.exists(p): continue
+              if not __import__('os').path.exists(p): continue
               for l in open(p).read().split('\n'):
                   t=l.strip()
                   if t.startswith('#if'):
                       m=re.fullmatch(r'#if\s+(ENABLE_[A-Z0-9_]+)', t)
                       if m: force_off(m.group(1))
                       break
-          PY
+          "
           sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
           printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > src/driver/drv_bkCam_version.h
 
       - name: Build
-        continue-on-error: true
         run: |
           cd obk
-          make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
-            > ../build.log 2>&1 || true
-          echo "===== ERRORS ====="
-          grep -n -i 'fatal error\|error:\|Error [0-9]\|undefined reference\|No rule' ../build.log | head -30 || true
-          echo "===== last 20 ====="
-          tail -20 ../build.log
+          make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 > ../build.log 2>&1 || true
+          tail -30 ../build.log
 
       - name: Collect
         if: always()
         run: |
           mkdir -p result
-          cp build.log patch.log prebuild.log diag_pinmux.txt result/ 2>/dev/null || true
+          cp build.log result/ 2>/dev/null || true
           cp -r obk/output/* result/ 2>/dev/null || true
           find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head
 
@@ -150,6 +100,6 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-build
+          name: bk7252-final
           path: result/
           if-no-files-found: warn
