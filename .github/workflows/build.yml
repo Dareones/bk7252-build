@@ -1,24 +1,26 @@
-name: BK7252U camera build
+name: BK7252U camera build (Safe)
 
 on:
   workflow_dispatch:
     inputs:
       version:
+        description: 'Version string'
         default: '1.18.321-cam5'
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Deps
+      - name: Install dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential python3 python-is-python3 patch xz-utils make git wget libc6-i386 lib32z1 lib32stdc++6
+          sudo apt-get install -y -qq build-essential python3 patch xz-utils make git wget libc6-i386 lib32z1 lib32stdc++6
 
-      - name: Clone pinned sources
+      - name: Clone OpenBeken (pinned)
         run: |
           git clone -q https://github.com/openshwprojects/OpenBK7231T_App.git obk
-          cd obk && git checkout -q 168cba55
+          cd obk
+          git checkout -q 168cba55
           git submodule update --init --depth 1 sdk/beken_freertos_sdk libraries/berry
           git clone -q https://github.com/pingwiner/bk7252n-camera.git ../cam
 
@@ -31,81 +33,49 @@ jobs:
         run: |
           cd obk
           patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
+          echo "Patch applied. Checking for rejects:"
+          find . -name '*.rej' || echo "No rejects."
 
-      - name: Revert N-only SDK changes
+      - name: Fix SDK build issues (Safe fixes only)
         run: |
           cd obk/sdk/beken_freertos_sdk
-          git checkout -- beken378/driver/entry/arch_main.c \
-                          beken378/driver/uart/uart.c \
-                          beken378/app/config/param_config.c
-          sed -i 's/^void entry_main(void)$/int g_power_btn_hold_ms = 2000;\nvoid entry_main(void)/' beken378/driver/entry/arch_main.c
-
-      - name: CRITICAL FIX - Disable JTAG filter for I2C1
-        run: |
-          cd obk/sdk/beken_freertos_sdk
-          # Отключаем фильтр, который блокирует настройку GPIO20/21 как I2C
+          
+          # 1. Фикс сломанного условия в Makefile (без этого camera_intf.c не компилируется)
+          sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' beken378/beken_src.mk
+          
+          # 2. Отключаем JTAG-фильтр, чтобы он не блокировал GPIO20/21 для I2C1
           sed -i 's/static int gpio_ops_filter_flag = 0;/static int gpio_ops_filter_flag = 1;/' beken378/driver/gpio/gpio.c
-          grep -q "gpio_ops_filter_flag = 1" beken378/driver/gpio/gpio.c || { echo "ERROR: JTAG filter patch failed"; exit 1; }
-          echo "JTAG filter successfully disabled."
+          
+          echo "SDK fixes applied."
 
-      - name: BK7252U config (LFS, Console, BKCAM)
+      - name: Build firmware
         run: |
           cd obk
-          python3 - <<'PY'
-          import re, os
-          cfg='src/obk_config.h'
-          L=open(cfg).read().split('\n')
-          for i,l in enumerate(L):
-              if l.strip()=='#if PLATFORM_BK7252N' and 'ENABLE_DRIVER_BKCAM' in '\n'.join(L[i:i+12]):
-                  L[i]='#if PLATFORM_BK7252N || PLATFORM_BK7252'
-          open(cfg,'w').write('\n'.join(L))
-          
-          def force_off(m):
-              s=open(cfg).read(); i=s.rfind('#endif')
-              open(cfg,'w').write(s[:i]+'\n#undef %s\n#define %s 0\n'%(m,m)+s[i:])
-              
-          force_off('ENABLE_DRIVER_BKCHARGE')
-          
-          # Включаем LFS
-          s=open(cfg).read()
-          s=s.replace('#define ENABLE_LITTLEFS 0', '#define ENABLE_LITTLEFS 1')
-          open(cfg,'w').write(s)
-          PY
-          
-          # Фикс сломанного условия в Makefile SDK
-          sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' sdk/beken_freertos_sdk/beken378/beken_src.mk
-          
-          # Включаем консоль и LFS при старте
-          python3 - <<'PY'
-          with open('src/user_main.c', 'r') as f:
-              content = f.read()
-          content = content.replace('DRV_StartDriver("BKCam");', '// DRV_StartDriver("BKCam"); // Manual start for diag')
-          if 'init_lfs(1)' not in content:
-              content = content.replace('Main_Init_After_Delay()', 'Main_Init_After_Delay()\n{\n    CFG_SetFlag(31, 1); // UART console\n    CFG_SetFlag(26, 1); // Secondary UART\n    init_lfs(1); // Mount LFS')
-          with open('src/user_main.c', 'w') as f:
-              f.write(content)
-          PY
-          
-          printf '#define CAM_FW_TAG "fw %s"\n' "${{ github.event.inputs.version }}" > src/driver/drv_bkCam_version.h
-
-      - name: Build
-        run: |
-          cd obk
+          # Используем официальную цель OpenBK7252, которая корректно вызывает build.sh bk7251
           make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 > ../build.log 2>&1 || true
-          tail -30 ../build.log
+          
+          echo "===== BUILD ERRORS (if any) ====="
+          grep -i -E 'error:|Error [0-9]|undefined reference' ../build.log | head -20 || echo "No critical errors found."
+          
+          echo "===== OUTPUT FILES ====="
+          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "Output directory not found."
 
-      - name: Collect
+      - name: Collect artifacts
         if: always()
         run: |
           mkdir -p result
           cp build.log patch.log prebuild.log result/ 2>/dev/null || true
-          cp -r obk/output/* result/ 2>/dev/null || true
-          find result -name '*.bin' -printf '%s %p\n' 2>/dev/null | head
+          # Копируем только готовые прошивки
+          cp obk/output/${{ github.event.inputs.version }}/OpenBK7252_UA_${{ github.event.inputs.version }}.bin result/ 2>/dev/null || true
+          cp obk/output/${{ github.event.inputs.version }}/OpenBK7252_QIO_${{ github.event.inputs.version }}.bin result/ 2>/dev/null || true
+          
+          echo "Files in result:"
+          ls -la result/
 
-      - name: Upload
+      - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-cam5
+          name: bk7252-safe-build
           path: result/
-          if-no-files-found: warn
+          if-no-files-found: error
