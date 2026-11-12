@@ -584,7 +584,7 @@ jobs:
           PATCH_BASE64
           test -s "$PATCH_FILE"
           ACTUAL_SHA="$(sha256sum "$PATCH_FILE" | awk '{print $1}')"
-          EXPECTED_SHA="ce60c439d4070fb23561c439341c2deefc2d18552504987c1adfb2c36f159732"
+          EXPECTED_SHA="cc6f8b7e33b40c3474aed82eb8e63f8baab8c501c1e4fab35568cffc38e3e64b"
           if [[ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]]; then
             echo "Embedded patch checksum mismatch" >&2
             exit 1
