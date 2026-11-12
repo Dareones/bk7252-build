@@ -1,81 +1,168 @@
-name: BK7252U camera build (Safe)
+name: BK7252U GC0329 camera firmware
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: 'Version string'
-        default: '1.18.321-cam5'
+        description: Firmware version tag
+        required: true
+        type: string
+        default: 1.18.321-cam5
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bk7252u-camera-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      VERSION: ${{ inputs.version }}
+      OBK_COMMIT: 168cba55
+      EXPECTED_SDK_PREFIX: f5a64d4
+
     steps:
-      - name: Install dependencies
+      - name: Checkout build repository
+        uses: actions/checkout@v4
+
+      - name: Validate inputs and prepare diagnostics
+        shell: bash
         run: |
+          set -euo pipefail
+          if [[ ! "$VERSION" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Invalid version string: $VERSION" >&2
+            exit 2
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/result"
+          printf 'version=%s\n' "$VERSION" > "$GITHUB_WORKSPACE/result/build-info.txt"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
           sudo apt-get update -qq
-          sudo apt-get install -y -qq build-essential python3 patch xz-utils make git wget libc6-i386 lib32z1 lib32stdc++6
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 patch xz-utils make git wget \
+            libc6-i386 lib32z1 lib32stdc++6 binutils file
 
-      - name: Clone OpenBeken (pinned)
+      - name: Clone pinned OpenBeken and its pinned submodules
+        shell: bash
         run: |
-          git clone -q https://github.com/openshwprojects/OpenBK7231T_App.git obk
-          cd obk
-          git checkout -q 168cba55
-          git submodule update --init --depth 1 sdk/beken_freertos_sdk libraries/berry
-          git clone -q https://github.com/pingwiner/bk7252n-camera.git ../cam
+          set -euo pipefail
+          git clone https://github.com/openshwprojects/OpenBK7231T_App.git obk
+          git -C obk checkout "$OBK_COMMIT"
+          git -C obk submodule update --init --recursive --depth 1 \
+            sdk/beken_freertos_sdk libraries/berry
 
-      - name: Official prebuild
+          OBK_SHA="$(git -C obk rev-parse HEAD)"
+          SDK_SHA="$(git -C obk/sdk/beken_freertos_sdk rev-parse HEAD)"
+          BERRY_SHA="$(git -C obk/libraries/berry rev-parse HEAD)"
+          echo "OpenBK7231T_App=$OBK_SHA" | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
+          echo "beken_freertos_sdk=$SDK_SHA" | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
+          echo "berry=$BERRY_SHA" | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
+
+          [[ "${OBK_SHA:0:8}" == "$OBK_COMMIT" ]]
+          [[ "${SDK_SHA:0:${#EXPECTED_SDK_PREFIX}}" == "$EXPECTED_SDK_PREFIX" ]] || {
+            echo "Unexpected SDK revision. Expected prefix $EXPECTED_SDK_PREFIX, got $SDK_SHA" >&2
+            exit 1
+          }
+
+      - name: Check and apply BK7252U GC0329 patch
+        shell: bash
         run: |
-          cd obk
-          make prebuild_OpenBK7252 > ../prebuild.log 2>&1 || true
+          set -euo pipefail
+          PATCH_FILE="$GITHUB_WORKSPACE/bk7252_gc0329_cam5.patch"
+          test -s "$PATCH_FILE" || {
+            echo "Missing repository-root file: bk7252_gc0329_cam5.patch" >&2
+            exit 1
+          }
 
-      - name: Apply camera patch
+          cd "$GITHUB_WORKSPACE/obk"
+          patch --dry-run --batch --forward --fuzz=0 -p1 \
+            < "$PATCH_FILE" 2>&1 | tee "$GITHUB_WORKSPACE/patch-check.log"
+          patch --batch --forward --fuzz=0 -p1 \
+            < "$PATCH_FILE" 2>&1 | tee "$GITHUB_WORKSPACE/patch.log"
+
+          if find . -type f \( -name '*.rej' -o -name '*.orig' \) -print -quit | grep -q .; then
+            echo "Patch left .rej/.orig files; refusing to build" >&2
+            exit 1
+          fi
+
+          # Guard against accidentally building a non-camera or wrong-sensor tree.
+          grep -q 'ENABLE_DRIVER_CAMERA_BK7252=1' platforms/BK723x/OpenBeken.mk
+          grep -q 'gc0329v_init_talbe' sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.h
+          grep -q '0x31' src/driver/drv_camera_bk7252.c
+          grep -q 'ifeq ($(CFG_USE_CAMERA_INTF), 1)' sdk/beken_freertos_sdk/beken378/beken_src.mk
+          echo "Patch checks passed: BK7251/SOC_BK7221U + GC0329 7-bit SCCB 0x31"
+
+      - name: Build UART firmware and QIO image
+        shell: bash
         run: |
-          cd obk
-          patch -p1 --forward --no-backup-if-mismatch < ../cam/openbk-port/bk7252n-camera-openbk.patch > ../patch.log 2>&1 || true
-          echo "Patch applied. Checking for rejects:"
-          find . -name '*.rej' || echo "No rejects."
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/obk"
+          make APP_VERSION="$VERSION" APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
+            2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: Fix SDK build issues (Safe fixes only)
+      - name: Verify that a camera-enabled UART binary was produced
+        shell: bash
         run: |
-          cd obk/sdk/beken_freertos_sdk
-          
-          # 1. Фикс сломанного условия в Makefile (без этого camera_intf.c не компилируется)
-          sed -i 's/ifeq ($CFG_USE_CAMERA_INTF), 1)/ifeq ($(CFG_USE_CAMERA_INTF),1)/' beken378/beken_src.mk
-          
-          # 2. Отключаем JTAG-фильтр, чтобы он не блокировал GPIO20/21 для I2C1
-          sed -i 's/static int gpio_ops_filter_flag = 0;/static int gpio_ops_filter_flag = 1;/' beken378/driver/gpio/gpio.c
-          
-          echo "SDK fixes applied."
+          set -euo pipefail
+          UA="$(find "$GITHUB_WORKSPACE/obk/output" -type f \
+            -name "OpenBK7252_UA_${VERSION}.bin" -print -quit 2>/dev/null || true)"
+          if [[ -z "$UA" || ! -s "$UA" ]]; then
+            echo "Build returned without the required OpenBK7252_UA_${VERSION}.bin" >&2
+            find "$GITHUB_WORKSPACE/obk" -maxdepth 5 -type f \
+              \( -name '*.bin' -o -name '*.elf' -o -name '*.map' \) -printf '%p %s bytes\n' | head -100
+            exit 1
+          fi
 
-      - name: Build firmware
-        run: |
-          cd obk
-          # Используем официальную цель OpenBK7252, которая корректно вызывает build.sh bk7251
-          make APP_VERSION=${{ github.event.inputs.version }} APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 > ../build.log 2>&1 || true
-          
-          echo "===== BUILD ERRORS (if any) ====="
-          grep -i -E 'error:|Error [0-9]|undefined reference' ../build.log | head -20 || echo "No critical errors found."
-          
-          echo "===== OUTPUT FILES ====="
-          ls -la output/${{ github.event.inputs.version }}/ 2>/dev/null || echo "Output directory not found."
+          file "$UA"
+          stat -c 'UART binary size: %s bytes' "$UA"
+          strings "$UA" | grep -F 'Camera: BK7252 driver registered' >/dev/null || {
+            echo "Camera driver marker is missing from the UART image" >&2
+            exit 1
+          }
 
-      - name: Collect artifacts
+          mkdir -p "$GITHUB_WORKSPACE/result/firmware"
+          cp "$UA" "$GITHUB_WORKSPACE/result/firmware/"
+
+          QIO="$(find "$GITHUB_WORKSPACE/obk/output" -type f \
+            -name "OpenBK7252_QIO_${VERSION}.bin" -print -quit 2>/dev/null || true)"
+          if [[ -n "$QIO" && -s "$QIO" ]]; then
+            cp "$QIO" "$GITHUB_WORKSPACE/result/firmware/"
+          fi
+
+          for ext in elf map; do
+            find "$GITHUB_WORKSPACE/obk/sdk/beken_freertos_sdk/out" -maxdepth 1 \
+              -type f -name "bk7231_bsp.$ext" -exec cp {} "$GITHUB_WORKSPACE/result/" \; 2>/dev/null || true
+          done
+
+          (cd "$GITHUB_WORKSPACE/result/firmware" && sha256sum *.bin > SHA256SUMS.txt && md5sum *.bin > MD5SUMS.txt)
+          echo "Verified UART image: $(basename "$UA")" | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
+
+      - name: Collect build logs and diagnostics
         if: always()
+        shell: bash
         run: |
-          mkdir -p result
-          cp build.log patch.log prebuild.log result/ 2>/dev/null || true
-          # Копируем только готовые прошивки
-          cp obk/output/${{ github.event.inputs.version }}/OpenBK7252_UA_${{ github.event.inputs.version }}.bin result/ 2>/dev/null || true
-          cp obk/output/${{ github.event.inputs.version }}/OpenBK7252_QIO_${{ github.event.inputs.version }}.bin result/ 2>/dev/null || true
-          
-          echo "Files in result:"
-          ls -la result/
+          mkdir -p "$GITHUB_WORKSPACE/result/logs"
+          for f in patch-check.log patch.log build.log; do
+            [[ ! -f "$GITHUB_WORKSPACE/$f" ]] || cp "$GITHUB_WORKSPACE/$f" "$GITHUB_WORKSPACE/result/logs/"
+          done
+          if [[ -d "$GITHUB_WORKSPACE/obk/sdk/beken_freertos_sdk/out" ]]; then
+            find "$GITHUB_WORKSPACE/obk/sdk/beken_freertos_sdk/out" -maxdepth 1 \
+              -type f \( -name '*.elf' -o -name '*.map' \) -exec cp {} "$GITHUB_WORKSPACE/result/" \; 2>/dev/null || true
+          fi
+          find "$GITHUB_WORKSPACE/result" -maxdepth 3 -type f -printf '%p %s bytes\n' | sort
 
-      - name: Upload artifacts
+      - name: Upload firmware, symbols and logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bk7252-safe-build
+          name: BK7252U-GC0329-${{ inputs.version }}
           path: result/
           if-no-files-found: error
+          retention-days: 14
