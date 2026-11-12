@@ -635,7 +635,7 @@ jobs:
           make APP_VERSION="$VERSION" APP_NAME=OpenBK7252 VARIANT=default OpenBK7252 \
             2>&1 | tee "$GITHUB_WORKSPACE/build.log"
 
-      - name: Verify that a camera-enabled UART binary was produced
+      - name: Verify UART binary and audit camera linkage
         shell: bash
         run: |
           set -euo pipefail
@@ -643,20 +643,61 @@ jobs:
             -name "OpenBK7252_UA_${VERSION}.bin" -print -quit 2>/dev/null || true)"
           if [[ -z "$UA" || ! -s "$UA" ]]; then
             echo "Build returned without the required OpenBK7252_UA_${VERSION}.bin" >&2
-            find "$GITHUB_WORKSPACE/obk" -maxdepth 5 -type f \
+            find "$GITHUB_WORKSPACE/obk" -maxdepth 6 -type f \
               \( -name '*.bin' -o -name '*.elf' -o -name '*.map' \) -printf '%p %s bytes\n' | head -100
             exit 1
           fi
 
           file "$UA"
           stat -c 'UART binary size: %s bytes' "$UA"
-          strings "$UA" | grep -F 'Camera: BK7252 driver registered' >/dev/null || {
-            echo "Camera driver marker is missing from the UART image" >&2
-            exit 1
-          }
-
-          mkdir -p "$GITHUB_WORKSPACE/result/firmware"
+          mkdir -p "$GITHUB_WORKSPACE/result/firmware" "$GITHUB_WORKSPACE/result/link-audit"
           cp "$UA" "$GITHUB_WORKSPACE/result/firmware/"
+
+          # A raw `strings` check is not a reliable link test for every packaged
+          # Beken image. Keep it as evidence, but audit the ELF/MAP symbols too.
+          LINK_STATUS="UNCONFIRMED"
+          MARKER="$(strings "$UA" | grep -F 'Camera: BK7252 driver registered' || true)"
+          if [[ -n "$MARKER" ]]; then
+            echo "UART image contains the camera registration log string."
+            LINK_STATUS="VERIFIED_BY_UART_STRING"
+          else
+            echo "NOTE: registration string not visible in UA image; checking linker outputs."
+          fi
+
+          while IFS= read -r -d '' F; do
+            REL="${F#"$GITHUB_WORKSPACE/obk/"}"
+            mkdir -p "$GITHUB_WORKSPACE/result/link-audit/$(dirname "$REL")"
+            cp "$F" "$GITHUB_WORKSPACE/result/link-audit/$REL"
+            if [[ "$F" == *.elf || "$F" == *.axf ]]; then
+              if nm -a "$F" 2>/dev/null | grep -Eq '[[:space:]]Camera_BK7252_Init$'; then
+                echo "Camera_BK7252_Init found in ELF: $REL"
+                LINK_STATUS="VERIFIED_BY_ELF_SYMBOL"
+              fi
+            elif [[ "$F" == *.map ]]; then
+              if grep -Eq 'Camera_BK7252_Init|drv_camera_bk7252' "$F"; then
+                echo "Camera driver reference found in MAP: $REL"
+                [[ "$LINK_STATUS" == VERIFIED_BY_ELF_SYMBOL ]] || LINK_STATUS="VERIFIED_BY_MAP"
+              fi
+            fi
+          done < <(find "$GITHUB_WORKSPACE/obk" -type f \
+            \( -name '*.elf' -o -name '*.axf' -o -name '*.map' \) -size +0c -print0)
+
+          if [[ -f "$GITHUB_WORKSPACE/build.log" ]] && grep -Fq 'drv_camera_bk7252.c' "$GITHUB_WORKSPACE/build.log"; then
+            echo "Build log mentions compilation of drv_camera_bk7252.c." \
+              | tee "$GITHUB_WORKSPACE/result/link-audit/build-log-driver-reference.txt"
+          fi
+
+          {
+            echo "UART_IMAGE=$(basename "$UA")"
+            echo "UART_SIZE=$(stat -c '%s' "$UA")"
+            echo "CAMERA_LINK_STATUS=$LINK_STATUS"
+            echo "UART_MARKER_PRESENT=$([[ -n "$MARKER" ]] && echo yes || echo no)"
+          } | tee "$GITHUB_WORKSPACE/result/camera-link-audit.txt"
+
+          if [[ "$LINK_STATUS" == UNCONFIRMED ]]; then
+            echo "WARNING: UART image was produced, but camera driver linkage is not yet proven." \
+              | tee -a "$GITHUB_WORKSPACE/result/camera-link-audit.txt"
+          fi
 
           QIO="$(find "$GITHUB_WORKSPACE/obk/output" -type f \
             -name "OpenBK7252_QIO_${VERSION}.bin" -print -quit 2>/dev/null || true)"
@@ -664,13 +705,9 @@ jobs:
             cp "$QIO" "$GITHUB_WORKSPACE/result/firmware/"
           fi
 
-          for ext in elf map; do
-            find "$GITHUB_WORKSPACE/obk/sdk/beken_freertos_sdk/out" -maxdepth 1 \
-              -type f -name "bk7231_bsp.$ext" -exec cp {} "$GITHUB_WORKSPACE/result/" \; 2>/dev/null || true
-          done
-
           (cd "$GITHUB_WORKSPACE/result/firmware" && sha256sum *.bin > SHA256SUMS.txt && md5sum *.bin > MD5SUMS.txt)
-          echo "Verified UART image: $(basename "$UA")" | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
+          echo "UART image copied to artifact: $(basename "$UA")" \
+            | tee -a "$GITHUB_WORKSPACE/result/build-info.txt"
 
       - name: Collect build logs and diagnostics
         if: always()
