@@ -109,7 +109,7 @@ jobs:
           Du4m8P3RexaaMIKu48cA5P474FeE5d0mfpi+A4MKzQKwoZ4RDM/h26LgEKjIddM3mCJJxowolSVL
           6Zs8HW3rqncBci89xRitYNiOFqBHW9NgeN8CBYMayABGdKPQveM13NHt1B1iBRJyjXb77PK0C+Zs
           8+bU2O5BdwGwDvIXjZ8NBZgEw7KInKqwL8CM52oFyOmAkxNaS5gRh+0b4egM0GtQsNj6lcKFEVGW
-          /hPIZaA8CskP0iQwDYzmJ3pwzF32E4ieaEGSH3AKkuYuEZBAC4xIr2LcT5wI/AL1gBkL+B0d8c5A
+          /hPIZaA8CskP0qQwDYzmJ3pwzF32E4ieaEGSH3AKkuYuEZBAC4xIr2LcT5wI/AL1gBkL+B0d8c5A
           jEdTyra6o9Cl22feHjNeMV3VRUHdaLU6VwOXC/7L8/PGRbuPq1xGeQNs6S2mQABTDLgMccQ8XhPB
           PMZoLpNRtFPAxCiufqd1edFuXP+NwIo8BZ+4B2g+m2K5wEuCWWEESRhKPK9lHoNO9ZFRoCqlzfpp
           F/BgvDgDkLrxwietuLKdPsqiRR55Rva5mnb9c69xed7Dbq4arcE+Z/BPvj8HpgBOLVK6QZqhsegj
@@ -223,6 +223,30 @@ jobs:
           qsZgH6ttr9EOz5pCY1R9RevsgjaZYKE9VTrtDMrLRm1mqbwAZbYJzOx1cMjduA4Gviz058YrWPI9
           RiFSajuBM6TsEXEDVHaFFu41FNJR/KDZqMzinFz8ViaQ+qabjv4PvoYImeyLAAA=
           B64_EOF
+          python3 - <<'PY_CHK'
+          import hashlib, sys
+          txt = open('/tmp/patch.gz.b64').read()
+          lines = txt.split(chr(10))
+          while lines and lines[-1] == '':
+              lines.pop()
+          got_file = hashlib.sha256((chr(10).join(lines) + chr(10)).encode()).hexdigest()
+          if got_file != 'f299b64a7f55e7e26f8d547476c74ad4a7990dec1d2c6e4dc72c5798b0d1db2d':
+              print('B64 BLOCK CORRUPTED (paste/transport error), locating chunks:')
+              exp = ["31b867168cc5", "b80002e7ed08", "c6ca96290b3c", "87e93bb64ead", "91fdea6d8152", "6a7fd0a2ff04", "d5840829c900", "c02c49d9dd95", "6d5ae0a3e7e8", "ebd0a82cde37", "3308bcf93ee1", "bd0b4f0e3674", "42e7c997041e", "57be3cf24111", "a8a446c413cf", "52084d30c1be", "a31a405abbd9", "b2a5332c88b7", "4d6dc2ff081a", "89760fabe98c"]
+              bad = []
+              for ci in range(len(exp)):
+                  part = lines[ci * 10:ci * 10 + 10]
+                  if len(part) == 0:
+                      got = 'MISSING'
+                  else:
+                      got = hashlib.sha256((chr(10).join(part) + chr(10)).encode()).hexdigest()[:12]
+                  if got != exp[ci]:
+                      bad.append(ci + 1)
+              print('corrupt chunk numbers (1-based, 10 lines each):', bad)
+              print('total lines:', len(lines), 'expected:', len(exp) * 10)
+              sys.exit(1)
+          print('b64 block intact')
+          PY_CHK
           base64 -di /tmp/patch.gz.b64 | gunzip > bk7252_118321_cam.patch
           echo "278e901e07c25a602d9a83fc1b2297688921901942ceba33bfab70331f884724  bk7252_118321_cam.patch" | sha256sum -c -
           wc -c bk7252_118321_cam.patch
