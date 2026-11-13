@@ -2,10 +2,6 @@ name: Build OpenBeken BK7252 1.18.321-cam5 (LFS + UART console + camera, cam5 I2
 
 on:
   workflow_dispatch:
-  push:
-    branches: [ main ]
-    paths:
-      - '.github/workflows/build.yml'
 
 jobs:
   build:
@@ -19,6 +15,7 @@ jobs:
         run: |
           mkdir -p app
           curl -fsSL -o /tmp/app.tar.gz https://github.com/openshwprojects/OpenBK7231T_App/archive/refs/tags/1.18.321.tar.gz
+          echo "07fe1498dd5188899b0323fee850d4cabac498b307b26d92862f9d7fdec8ad63  /tmp/app.tar.gz" | sha256sum -c -
           tar -xzf /tmp/app.tar.gz -C app --strip-components=1
           rm -rf app/sdk/beken_freertos_sdk app/libraries/berry
           mkdir -p app/sdk/beken_freertos_sdk app/libraries/berry
@@ -28,705 +25,185 @@ jobs:
           tar -xzf /tmp/berry.tar.gz -C app/libraries/berry --strip-components=1
           echo "sources ready"
 
-      - name: Write embedded BK7252 patch
+      - name: Write embedded BK7252 patch (gzip+base64)
         run: |
-          cat > bk7252_118321_cam.patch <<'PATCH_EOF'
-          --- a/platforms/BK723x/OpenBeken.mk
-          +++ b/platforms/BK723x/OpenBeken.mk
-          @@ -17,6 +17,17 @@
-           else ifeq ($(CFG_SOC_NAME), 3)
-           CCFLAGS += -DPLATFORM_BK7252
-           CCFLAGS += -DENABLE_DRIVER_MDNS=1 -DLWIP_MDNS_RESPONDER=1 -DLWIP_NUM_NETIF_CLIENT_DATA=1
-          +# enable LittleFS config storage (uses the unused OTA download partition 0x132000-0x1E0000)
-          +CCFLAGS += -DENABLE_LITTLEFS=1
-          +# enable BK7252 camera driver (DVP + hardware JPEG, SDK camera_intf)
-          +CCFLAGS += -DENABLE_DRIVER_CAMERA_BK7252=1
-          +INCLUDES += -I$(ROOT_DIR)/beken378/func/camera_intf
-          +INCLUDES += -I$(ROOT_DIR)/beken378/func/video_transfer
-          +INCLUDES += -I$(ROOT_DIR)/beken378/driver/jpeg
-          +INCLUDES += -I$(ROOT_DIR)/beken378/driver/i2c
-          +INCLUDES += -I$(ROOT_DIR)/beken378/driver/include
-          +INCLUDES += -I$(ROOT_DIR)/beken378/os/include
-          +APP_C += $(OBK_DIR)/driver/drv_camera_bk7252.c
-           else ifeq ($(CFG_SOC_NAME), 5)
-           CCFLAGS += -DPLATFORM_BK7231N
-           else ifeq ($(CFG_SOC_NAME), 7)
-          --- a/sdk/beken_freertos_sdk/beken378/beken_src.mk
-          +++ b/sdk/beken_freertos_sdk/beken378/beken_src.mk
-          @@ -626,10 +626,11 @@
-           SRC_FUNC_C += ./beken378/func/utf8/conv_utf8.c
-           
-           # video / jpeg
-          -ifeq ($CFG_USE_CAMERA_INTF), 1)
-          +# BK7252 port fix: condition was written as ($CFG_USE_CAMERA_INTF) which never
-          +# matched, so camera_intf never compiled; gc2145/video_transfer are not needed
-          +# by the OpenBeken camera driver and only add flash/RAM
-          +ifeq ($(CFG_USE_CAMERA_INTF), 1)
-           SRC_FUNC_C += ./beken378/func/camera_intf/camera_intf.c
-          -SRC_FUNC_C += ./beken378/func/camera_intf/camera_intf_gc2145.c
-          -SRC_FUNC_C += ./beken378/func/video_transfer/video_transfer.c
-           endif
-           
-           ifeq ($(CFG_LOW_VOLTAGE_PS), 1)
-          --- a/sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf_config.h
-          +++ b/sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf_config.h
-          @@ -40,6 +40,10 @@
-           #define HM_1055_DEV             (0xABC06)
-           #define GC_2145_DEV             (0xABC07)
-           
-          +// BK7252 port: stock firmware of the A9 PTZ camera boots this sensor with
-          +// gUsedCam=0xABC03 (vendor "GC0329" slot = GC0328C_DEV here); sensor chip ID
-          +// reads 0xF0=0x07/0xF1=0x01 (GC-family clone), register map is GC0328C-like
-          +// but with vendor-specific final values - switch tables here if frame is black
-           #define USE_CAMERA              GC0328C_DEV
-           
-           #define PAS6329_DEV_ID          (0x40)
-          --- a/sdk/beken_freertos_sdk/beken378/driver/i2c/i2c1.c
-          +++ b/sdk/beken_freertos_sdk/beken378/driver/i2c/i2c1.c
-          @@ -220,8 +220,11 @@
-               sddev_control(ICU_DEV_NAME, CMD_ICU_INT_DISABLE, &param);
-           }
-           
-          +volatile UINT32 i2c1_isr_count = 0;   // cam5 diagnostics: ISR dispatch check
-          +
-           static void i2c1_isr(void)
-           {
-          +    i2c1_isr_count++;
-              unsigned long   i2c1_config;
-              unsigned long   work_mode, ack_rx, sta, si;
-           
-          --- a/src/cmnds/cmd_main.c
-          +++ b/src/cmnds/cmd_main.c
-          @@ -769,6 +769,7 @@
-           #if PLATFORM_BEKEN || PLATFORM_ARMINO
-               char a;
-               int i;
-          +	int pos;
-               int totalSize;
-               char tmp[128];
-           
-          @@ -783,22 +784,41 @@
-                       break;
-                   }
-               }
-          -	if (totalSize < 2) {
-          -		return;
-          -	}
-          -	// skip garbage data (should not happen)
-          -	for (i = 0; i < totalSize; i++) {
-          -		a = UART_GetByte(i);
-          -		if (i + 1 < sizeof(tmp)) {
-          -			tmp[i] = a;
-          -			tmp[i + 1] = 0;
-          -		}
-          -		if (a == '\n') {
-          +	// read the line byte by byte, echo it back and support backspace,
-          +	// so typing commands in a terminal over the log UART is usable
-          +	pos = 0;
-          +	tmp[0] = 0;
-          +	i = 0;
-          +	while (i < totalSize) {
-          +		a = UART_GetByte(0);
-          +		UART_ConsumeBytes(1);
-          +		i++;
-          +		if (a == '\n' || a == '\r') {
-                      break;
-                  }
-          +		if (a == 0x08 || a == 0x7F) {
-          +			// backspace: erase last char locally and in the terminal
-          +			if (pos > 0) {
-          +				pos--;
-          +				tmp[pos] = 0;
-          +				UART_SendByte(0x08);
-          +				UART_SendByte(' ');
-          +				UART_SendByte(0x08);
-          +			}
-          +			continue;
-          +		}
-          +		if (a >= 32 && a < 127) {
-          +			if (pos + 1 < (int)sizeof(tmp)) {
-          +				tmp[pos++] = a;
-          +				tmp[pos] = 0;
-          +				// echo so the user sees what they type
-          +				UART_SendByte(a);
-          +			}
-          +		}
-          +	}
-          +	if (pos > 0) {
-          +		CMD_ExecuteCommand(tmp, 0);
-              }
-          -	UART_ConsumeBytes(i);
-          -	CMD_ExecuteCommand(tmp, 0);
-           #endif
-           }
-           void CMD_RunUartCmndIfRequired() {
-          --- a/src/littlefs/our_lfs.h
-          +++ b/src/littlefs/our_lfs.h
-          @@ -66,6 +66,15 @@
-           // end of OTA flash
-           #define LFS_BLOCKS_END 0x1E0000
-           
-          +#elif PLATFORM_BK7252
-          +// BK7251/BK7252 with beken_freertos_sdk on 2MB flash:
-          +// app is 0x10000-0x121000, the OTA "download" partition is
-          +// 0x132000-0x1E0000 and is never used by OpenBeken,
-          +// vendor MAC/calibration data live above 0x1E0000
-          +#define LFS_BLOCKS_START 0x132000
-          +#define LFS_BLOCKS_START_MIN 0x132000
-          +#define LFS_BLOCKS_END 0x1E0000
-          +
-           #elif PLATFORM_BL602 || PLATFORM_BL_NEW
-           
-           #define LFS_BLOCKS_START 0x0
-          --- a/src/user_main.c
-          +++ b/src/user_main.c
-          @@ -1368,8 +1368,15 @@
-               // don't create if it does not mount
-               // do this for ST mode only, as it may be something in FS which is killing us,
-               // and we may add a command to empty fs just be writing first sector?
-          +#if PLATFORM_BK7252
-          +	// on BK7251/BK7252 the LFS area (OTA download partition 0x132000-0x1E0000)
-          +	// is blank on first boot, so format and mount right away,
-          +	// otherwise 'lfs is absent' would stay forever
-          +	init_lfs(1);
-          +#else
-               init_lfs(0);
-           #endif
-          +#endif
-           
-               PIN_SetGenericDoubleClickCallback(app_on_generic_dbl_click);
-               ADDLOGF_DEBUG("Initialised other callbacks");
-          @@ -1531,6 +1538,16 @@
-               }
-               CFG_InitAndLoad();
-           
-          +#if PLATFORM_BK7252
-          +	// the camera exposes only its log UART (BK UART2). Without these flags
-          +	// typed characters would be ignored: the console is gated by
-          +	// OBK_FLAG_CMD_ACCEPT_UART_COMMANDS and, by default, listens on the
-          +	// wrong port - OBK_FLAG_USE_SECONDARY_UART switches it to BK UART2,
-          +	// the same port the logs are printed to
-          +	CFG_SetFlag(OBK_FLAG_CMD_ACCEPT_UART_COMMANDS, true);
-          +	CFG_SetFlag(OBK_FLAG_USE_SECONDARY_UART, true);
-          +#endif
-          +
-           #if ENABLE_DRIVER_XIAOMI_COMPACT4
-               // Keep motor hardware inert before normal driver startup and throughout safe mode.
-               XiaomiCompact4_PreDriverSafetyInit(bSafeMode);
-          @@ -1540,6 +1557,14 @@
-               LFSAddCmds();
-           #endif
-           
-          +#if ENABLE_DRIVER_CAMERA_BK7252
-          +	// BK7252 DVP camera: register commands and http endpoints
-          +	{
-          +		extern void Camera_BK7252_Init(void);
-          +		Camera_BK7252_Init();
-          +	}
-          +#endif
-          +
-               // only initialise certain things if we are not in AP mode
-               if (!bSafeMode)
-               {
-          --- a/src/driver/drv_camera_bk7252.c
-          +++ b/src/driver/drv_camera_bk7252.c
-          @@ -0,0 +1,494 @@
-          +// BK7252 camera driver for OpenBeken
-          +// - DVP capture + hardware JPEG encoder via Beken camera_intf/EJPEG SDK modules
-          +// - sensor probe over SCCB (I2C1), single frame snapshot and MJPEG stream over HTTP
-          +//
-          +// commands: camera_detect, camera_on, camera_off, camera_info, camera_reg
-          +// http:     /camera.jpg  /camera.mjpg  /camview
-          +#include "../obk_config.h"
-          +
-          +#if ENABLE_DRIVER_CAMERA_BK7252
-          +
-          +#include <string.h>
-          +#include <stdio.h>
-          +
-          +#include "../new_common.h"
-          +#include "../cmnds/cmd_public.h"
-          +#include "../httpserver/new_http.h"
-          +#include "../logging/logging.h"
-          +
-          +// Beken SDK headers (include paths come from beken_src.mk)
-          +#include "drv_model_pub.h"
-          +#include "i2c_pub.h"
-          +#include "gpio_pub.h"
-          +#include "mem_pub.h"
-          +#include "uart_pub.h"
-          +#include "intc_pub.h"
-          +#include "camera_intf_pub.h"
-          +#include "video_transfer.h"
-          +#include "jpeg_encoder_pub.h"
-          +
-          +#define CAM_LOG(...) ADDLOG_INFO(LOG_FEATURE_CMD, __VA_ARGS__)
-          +#define CAM_ERR(...) ADDLOG_ERROR(LOG_FEATURE_CMD, __VA_ARGS__)
-          +
-          +// DMA ring: EJPEG writes encoded jpeg stream here in node_len chunks
-          +#define CAM_NODE_LEN            1024
-          +#define CAM_NODE_COUNT          8
-          +static UINT8 *cam_rxbuf = NULL;
-          +
-          +// ping-pong frame buffers: one accumulates the frame being received,
-          +// the other holds the latest completed jpeg (safe to read over HTTP)
-          +#define CAM_BUF_SIZE            (48 * 1024)
-          +static UINT8 *cam_buf[2] = { NULL, NULL };
-          +
-          +// allocate once, firmware lifetime; handlers check for NULL
-          +static int cam_buffers_init(void)
-          +{
-          +	if (cam_rxbuf != NULL) {
-          +		return 0;
-          +	}
-          +	cam_rxbuf = (UINT8 *)os_malloc(CAM_NODE_LEN * CAM_NODE_COUNT);
-          +	cam_buf[0] = (UINT8 *)os_malloc(CAM_BUF_SIZE);
-          +	cam_buf[1] = (UINT8 *)os_malloc(CAM_BUF_SIZE);
-          +	if (cam_rxbuf == NULL || cam_buf[0] == NULL || cam_buf[1] == NULL) {
-          +		CAM_ERR("Camera: os_malloc failed for capture buffers");
-          +		if (cam_rxbuf) { os_free(cam_rxbuf); cam_rxbuf = NULL; }
-          +		if (cam_buf[0]) { os_free(cam_buf[0]); cam_buf[0] = NULL; }
-          +		if (cam_buf[1]) { os_free(cam_buf[1]); cam_buf[1] = NULL; }
-          +		return -1;
-          +	}
-          +	return 0;
-          +}
-          +
-          +static TVIDEO_DESC_ST cam_desc;
-          +static volatile int cam_started = 0;
-          +static volatile int cam_starting = 0;
-          +static UINT32 cam_ppi = QVGA_320_240;
-          +static UINT32 cam_fps = TYPE_20FPS;
-          +
-          +// written from IRQ/timer context
-          +static volatile UINT32 cam_acc_idx = 0;   // buffer index being filled
-          +static volatile UINT32 cam_acc_len = 0;
-          +static volatile UINT32 cam_overflow = 0;
-          +static volatile UINT32 cam_latest_idx = 0;
-          +static volatile UINT32 cam_latest_len = 0;
-          +static volatile UINT32 cam_seq = 0;       // bumped once per complete frame
-          +static UINT32 cam_frames_total = 0;
-          +
-          +// called from GDMA irq (node chunks) and ejpeg timer (final chunk with is_eof)
-          +static void cam_rx_handler(void *curptr, UINT32 newlen, UINT32 is_eof, UINT32 frame_len)
-          +{
-          +	GLOBAL_INT_DECLARATION();
-          +	(void)frame_len;
-          +	if (newlen == 0) {
-          +		return;
-          +	}
-          +	if (cam_buf[0] == NULL || cam_buf[1] == NULL) {
-          +		return;
-          +	}
-          +	UINT32 idx = cam_acc_idx;
-          +	UINT32 len = cam_acc_len;
-          +	if (len + newlen > CAM_BUF_SIZE) {
-          +		cam_overflow = 1;
-          +		return;
-          +	}
-          +	memcpy(&cam_buf[idx][len], curptr, newlen);
-          +	len += newlen;
-          +	GLOBAL_INT_DISABLE();
-          +	cam_acc_len = len;
-          +	GLOBAL_INT_RESTORE();
-          +}
-          +
-          +// camera_intf calls this after the frame end interrupt + 2ms delay timer
-          +static void cam_end_handler(void)
-          +{
-          +	GLOBAL_INT_DECLARATION();
-          +	UINT32 len = cam_acc_len;
-          +	UINT32 idx = cam_acc_idx;
-          +
-          +	if (cam_overflow == 0 && len > 4) {
-          +		cam_latest_idx = idx;
-          +		cam_latest_len = len;
-          +		cam_seq++;
-          +	}
-          +	cam_frames_total++;
-          +	GLOBAL_INT_DISABLE();
-          +	cam_acc_len = 0;
-          +	cam_overflow = 0;
-          +	cam_acc_idx = idx ^ 1;
-          +	GLOBAL_INT_RESTORE();
-          +}
-          +
-          +static int cam_start(void)
-          +{
-          +	if (cam_started) {
-          +		return 0;
-          +	}
-          +	if (cam_starting) {
-          +		return -1;
-          +	}
-          +	cam_starting = 1;
-          +
-          +	if (cam_buffers_init() != 0) {
-          +		cam_starting = 0;
-          +		return -2;
-          +	}
-          +
-          +	memset(&cam_desc, 0, sizeof(cam_desc));
-          +	cam_desc.rxbuf = cam_rxbuf;
-          +	cam_desc.rxbuf_len = CAM_NODE_LEN * CAM_NODE_COUNT;
-          +	cam_desc.node_len = CAM_NODE_LEN;
-          +	cam_desc.rx_read_len = 0;
-          +	cam_desc.sener_cfg = 0;
-          +	CMPARAM_SET_PPI(cam_desc.sener_cfg, cam_ppi);
-          +	CMPARAM_SET_FPS(cam_desc.sener_cfg, cam_fps);
-          +	cam_desc.node_full_handler = cam_rx_handler;
-          +	cam_desc.data_end_handler = cam_end_handler;
-          +
-          +	cam_acc_len = 0;
-          +	cam_overflow = 0;
-          +
-          +	int ret = camera_intfer_init(&cam_desc);
-          +	if (ret != 1) {
-          +		CAM_ERR("Camera: camera_intfer_init failed %i (sensor missing?)", ret);
-          +		cam_starting = 0;
-          +		return ret;
-          +	}
-          +	cam_started = 1;
-          +	cam_starting = 0;
-          +	CAM_LOG("Camera: started, ppi=%i fps=%i", (int)cam_ppi, (int)cam_fps);
-          +	return 0;
-          +}
-          +
-          +static void cam_stop(void)
-          +{
-          +	if (!cam_started) {
-          +		return;
-          +	}
-          +	camera_intfer_deinit();
-          +	cam_started = 0;
-          +	CAM_LOG("Camera: stopped");
-          +}
-          +
-          +// wait for a complete frame, returns 0 on success
-          +static int cam_wait_frame(UINT32 timeout_ms)
-          +{
-          +	UINT32 waited = 0;
-          +	while (cam_seq == 0 || cam_latest_len == 0) {
-          +		if (!cam_started || waited >= timeout_ms) {
-          +			return -1;
-          +		}
-          +		rtos_delay_milliseconds(50);
-          +		waited += 50;
-          +	}
-          +	return 0;
-          +}
-          +
-          +// ---------- SCCB helpers (own i2c session, use while camera is stopped) ----------
-          +
-          +static int cam_sccb_open(DD_HANDLE *h)
-          +{
-          +	UINT32 status = 0;
-          +	*h = ddev_open(I2C1_DEV_NAME, &status, 0);
-          +	if (*h == DD_HANDLE_UNVALID) {
-          +		CAM_ERR("Camera: open I2C1 failed");
-          +		return -1;
-          +	}
-          +	// route I2C1 pads to the camera FPC ("20pin to 24pin" mux) - the sensor
-          +	// stays silent (no ack) without this, stock does the same in
-          +	// camera_intfer_init (camera_intf.c)
-          +	UINT32 io_output_en = 1;
-          +	ddev_control(*h, I2C1_CMD_SET_IO_OUTPUT, &io_output_en);
-          +	return 0;
-          +}
-          +
-          +static int cam_sccb_read_reg(DD_HANDLE h, UINT8 slave, UINT8 reg, UINT8 *val)
-          +{
-          +	I2C_OP_ST op;
-          +	int rc;
-          +	// cam5: zero the op struct - stray fields previously leaked into the driver
-          +	os_memset(&op, 0, sizeof(op));
-          +	op.addr_width = ADDR_WIDTH_8;
-          +	op.salve_id = slave;
-          +	op.op_addr = reg;
-          +	rc = ddev_read(h, (char *)val, 1, (UINT32)&op);
-          +	return rc != 0;
-          +}
-          +
-          +static int cam_sccb_write_reg(DD_HANDLE h, UINT8 slave, UINT8 reg, UINT8 val)
-          +{
-          +	I2C_OP_ST op;
-          +	int rc;
-          +	os_memset(&op, 0, sizeof(op));
-          +	op.addr_width = ADDR_WIDTH_8;
-          +	op.salve_id = slave;
-          +	op.op_addr = reg;
-          +	rc = ddev_write(h, (char *)&val, 1, (UINT32)&op);
-          +	return rc != 0;
-          +}
-          +
-          +// ---------- cam5 I2C1 diagnostics ----------
-          +// legacy i2c1.c: rc=1 means EITHER no-ack (ISR ran, NACK branch) OR timeout
-          +// (ISR never ran, TransDone stuck 0) - the return code cannot tell them apart.
-          +// i2c1_isr_count (added to sdk i2c1.c) shows whether the ISR dispatches at all.
-          +extern volatile UINT32 i2c1_isr_count;
-          +// legacy register map (SOC_BK7221U): CONFIG +0, DAT +4
-          +// CONFIG bits: ENSMB=0 STA=1 STO=2 ACK_TX=3 TX_MODE=4 FREQ_DIV=6..15
-          +//              SI=16 ACK_RX=17 ACK_REQ=18 BUSY=19
-          +#define CAM_I2C1_REG_CONFIG  (*(volatile UINT32 *)0x00802300)
-          +#define CAM_I2C1_REG_DAT     (*(volatile UINT32 *)0x00802304)
-          +
-          +static void cam_i2c_diag(DD_HANDLE h, UINT8 slave, int wr_rc, int rd_rc)
-          +{
-          +	UINT32 si, ackrx, busy, m20 = 0xFFFFFFFF, m21 = 0xFFFFFFFF;
-          +
-          +	si = ddev_control(h, I2C1_CMD_GET_SMBUS_INTERRUPT, 0);
-          +	ackrx = ddev_control(h, I2C1_CMD_GET_ACK_RX, 0);
-          +	busy = ddev_control(h, I2C1_CMD_GET_SMBUS_BUSY, 0);
-          +	gpio_get_config(20, &m20);
-          +	gpio_get_config(21, &m21);
-          +	CAM_LOG("CAM5DIAG addr=0x%02X wr=%i rd=%i ISRcnt=%u SI=%u ACKRX=%u BUSY=%u CFG=0x%08X DAT=0x%08X pad20=%u pad21=%u",
-          +		slave, wr_rc, rd_rc, (unsigned)i2c1_isr_count,
-          +		(unsigned)si, (unsigned)ackrx, (unsigned)busy,
-          +		CAM_I2C1_REG_CONFIG, CAM_I2C1_REG_DAT,
-          +		(unsigned)(m20 & 0xFF), (unsigned)(m21 & 0xFF));
-          +	CAM_LOG("CAM5DIAG legend: ISRcnt=0 -> ISR not dispatched (clock/INTC); ISRcnt>0+ACKRX=0 -> NACK (sensor/bus); "
-          +		"SI=1 -> int stuck; CFG bits19=BUSY 17=ACKRX 16=SI 15:6=FREQ_DIV 4=TX 0=ENSMB; pad 1=I2C1-mux 2=JTAG 0=GPIO");
-          +}
-          +
-          +static const UINT8 cam_probe_addrs[] = {
-          +	0x31, 0x21, 0x6E, 0x24, 0x3C, 0x40, 0x60, 0x20, 0x30, 0x36, 0x10, 0x1A
-          +};
-          +
-          +static const char *cam_guess_sensor(UINT8 id)
-          +{
-          +	switch (id) {
-          +	case 0x07: return "GC0329-family clone (A9 board, SCCB 0x31)";
-          +	case 0x9B: return "GC0308?";
-          +	case 0x9D: return "GC0328/GC0329?";
-          +	case 0x9E: return "GC0309?";
-          +	case 0xB8: return "GC0311?";
-          +	default: return "unknown";
-          +	}
-          +}
-          +
-          +static void CMD_Camera_Detect(const void *context, const char *cmd, const char *args, int cmdFlags)
-          +{
-          +	DD_HANDLE h = DD_HANDLE_UNVALID;
-          +	int i;
-          +	UINT8 data;
-          +	int found = 0;
-          +
-          +	if (cam_started) {
-          +		CAM_ERR("Camera: stop it first (camera_off)");
-          +		return;
-          +	}
-          +	if (cam_sccb_open(&h)) {
-          +		return;
-          +	}
-          +	camera_power_on();
-          +	rtos_delay_milliseconds(30);
-          +
-          +	CAM_LOG("Camera: probing SCCB bus (I2C1), %i addresses (0x31 first)", (int)(sizeof(cam_probe_addrs)));
-          +	for (i = 0; i < sizeof(cam_probe_addrs); i++) {
-          +		UINT8 slave = cam_probe_addrs[i];
-          +		UINT8 id = 0, id2 = 0, r0 = 0, r1 = 0;
-          +		int wr_rc = 0, rd_rc = 0;
-          +		// one retry: SCCB over the FPC mux occasionally NAKs the first try
-          +		rd_rc = cam_sccb_read_reg(h, slave, 0xF0, &id);
-          +		if (rd_rc != 0) {
-          +			rtos_delay_milliseconds(5);
-          +			rd_rc = cam_sccb_read_reg(h, slave, 0xF0, &id);
-          +			if (rd_rc != 0) {
-          +				ADDLOG_DEBUG(LOG_FEATURE_CMD, "Camera: device 0x%02X: no ack", slave);
-          +				// cam5: dump controller/bus state once, on the first probed address
-          +				if (slave == 0x31) {
-          +					wr_rc = cam_sccb_write_reg(h, slave, 0xFC, 0x16);
-          +					cam_i2c_diag(h, slave, wr_rc, rd_rc);
-          +				}
-          +				continue;
-          +			}
-          +		}
-          +		found++;
-          +		cam_sccb_read_reg(h, slave, 0xF1, &id2);
-          +		cam_sccb_read_reg(h, slave, 0x00, &r0);
-          +		cam_sccb_read_reg(h, slave, 0x01, &r1);
-          +		CAM_LOG("Camera: device 0x%02X: ID 0xF0=0x%02X 0xF1=0x%02X reg00=0x%02X reg01=0x%02X (%s)",
-          +			slave, id, id2, r0, r1, cam_guess_sensor(id));
-          +	}
-          +	data = data;
-          +	ddev_close(h);
-          +
-          +	if (found == 0) {
-          +		CAM_ERR("Camera: no device answered (0x31 incl). Full init test anyway:");
-          +	} else {
-          +		CAM_LOG("Camera: probe done, %i device(s). Now running FULL init (vendor path):", found);
-          +	}
-          +
-          +	// full bring-up exactly like the stock firmware boot: camera_power_on ->
-          +	// ejpeg cfg -> I2C1 open -> vendor init table (every write is ACK-checked)
-          +	// -> leaves the camera running on success, ready for /camera.jpg
-          +	if (cam_start() == 0) {
-          +		CAM_LOG("Camera: FULL INIT OK - all table writes ACKed, camera running. Open /camera.jpg or /camview");
-          +	} else {
-          +		CAM_ERR("Camera: full init FAILED - see camera_intfer_init error code above");
-          +	}
-          +}
-          +
-          +static void CMD_Camera_On(const void *context, const char *cmd, const char *args, int cmdFlags)
-          +{
-          +	Tokenizer_TokenizeString(args, 0);
-          +	int n = Tokenizer_GetArgsCount();
-          +	if (n > 0) {
-          +		if (!stricmp(Tokenizer_GetArg(0), "vga")) {
-          +			cam_ppi = VGA_640_480;
-          +		} else {
-          +			cam_ppi = QVGA_320_240;
-          +		}
-          +	}
-          +	if (n > 1) {
-          +		int fps = Tokenizer_GetArgInteger(1);
-          +		if (fps <= 5) cam_fps = TYPE_5FPS;
-          +		else if (fps <= 10) cam_fps = TYPE_10FPS;
-          +		else if (fps <= 20) cam_fps = TYPE_20FPS;
-          +		else cam_fps = TYPE_30FPS;
-          +	}
-          +	cam_start();
-          +}
-          +
-          +static void CMD_Camera_Off(const void *context, const char *cmd, const char *args, int cmdFlags)
-          +{
-          +	cam_stop();
-          +}
-          +
-          +static void CMD_Camera_Info(const void *context, const char *cmd, const char *args, int cmdFlags)
-          +{
-          +	CAM_LOG("Camera: started=%i ppi=%i fps=%i frames=%i seq=%i lastLen=%i overflow=%i (buf %i KB x2)",
-          +		cam_started, (int)cam_ppi, (int)cam_fps, (int)cam_frames_total, (int)cam_seq,
-          +		(int)cam_latest_len, (int)cam_overflow, CAM_BUF_SIZE / 1024);
-          +}
-          +
-          +static void CMD_Camera_Reg(const void *context, const char *cmd, const char *args, int cmdFlags)
-          +{
-          +	DD_HANDLE h = DD_HANDLE_UNVALID;
-          +	Tokenizer_TokenizeString(args, 0);
-          +	if (Tokenizer_GetArgsCount() < 1) {
-          +		CAM_ERR("Usage: camera_reg <addr> [value] - SCCB reg of sensor, e.g. camera_reg 0xF0");
-          +		return;
-          +	}
-          +	if (cam_started) {
-          +		CAM_ERR("Camera: camera_reg conflicts with running camera, use camera_off first");
-          +		return;
-          +	}
-          +	UINT8 slave = 0x21; // default GC03xx SCCB address
-          +	UINT16 reg = (UINT16)Tokenizer_GetArgInteger(0);
-          +	UINT8 val = 0;
-          +	if (cam_sccb_open(&h)) {
-          +		return;
-          +	}
-          +	camera_power_on();
-          +	rtos_delay_milliseconds(10);
-          +	if (Tokenizer_GetArgsCount() >= 2) {
-          +		val = (UINT8)Tokenizer_GetArgInteger(1);
-          +		cam_sccb_write_reg(h, slave, (UINT8)reg, val);
-          +		rtos_delay_milliseconds(5);
-          +	}
-          +	UINT8 rd = 0;
-          +	if (cam_sccb_read_reg(h, slave, (UINT8)reg, &rd) == 0) {
-          +		CAM_LOG("Camera: sensor reg 0x%02X = 0x%02X (wrote 0x%02X)", reg, rd, val);
-          +	} else {
-          +		CAM_ERR("Camera: sensor reg 0x%02X read failed (no ack)", reg);
-          +	}
-          +	ddev_close(h);
-          +}
-          +
-          +// ---------- HTTP ----------
-          +
-          +// sends jpeg frame directly on the socket, bypassing the small reply buffer
-          +static int http_camera_jpg(http_request_t *request)
-          +{
-          +	char hdr[128];
-          +	if (cam_start() != 0 && !cam_started) {
-          +		poststr(request, "camera start failed");
-          +		poststr(request, NULL);
-          +		return 0;
-          +	}
-          +	if (cam_wait_frame(4000)) {
-          +		poststr(request, "no frame yet");
-          +		poststr(request, NULL);
-          +		return 0;
-          +	}
-          +	UINT32 len = cam_latest_len;
-          +	int n = snprintf(hdr, sizeof(hdr),
-          +		"HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\nConnection: close\r\n\r\n",
-          +		(unsigned)len);
-          +	send(request->fd, hdr, n, 0);
-          +	send(request->fd, cam_buf[cam_latest_idx], len, 0);
-          +	return 0; // already sent everything
-          +}
-          +
-          +static int http_camera_mjpg(http_request_t *request)
-          +{
-          +	char hdr[160];
-          +	UINT32 seq;
-          +	int maxFrames = 18000; // ~5 min at 60fps of our pacing
-          +
-          +	if (cam_start() != 0 && !cam_started) {
-          +		poststr(request, "camera start failed");
-          +		poststr(request, NULL);
-          +		return 0;
-          +	}
-          +	int n = snprintf(hdr, sizeof(hdr),
-          +		"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nConnection: close\r\n\r\n");
-          +	send(request->fd, hdr, n, 0);
-          +
-          +	while (maxFrames-- > 0) {
-          +		if (cam_wait_frame(4000)) {
-          +			break;
-          +		}
-          +		seq = cam_seq;
-          +		UINT32 len = cam_latest_len;
-          +		n = snprintf(hdr, sizeof(hdr),
-          +			"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-          +			(unsigned)len);
-          +		if (send(request->fd, hdr, n, 0) <= 0) break;
-          +		if (send(request->fd, cam_buf[cam_latest_idx], len, 0) <= 0) break;
-          +		if (send(request->fd, "\r\n", 2, 0) <= 0) break;
-          +		// wait for the NEXT frame
-          +		while (cam_seq == seq && cam_started && maxFrames > 0) {
-          +			rtos_delay_milliseconds(30);
-          +			maxFrames--;
-          +		}
-          +	}
-          +	return 0;
-          +}
-          +
-          +static int http_camera_view(http_request_t *request)
-          +{
-          +	http_setup(request, httpMimeTypeHTML);
-          +	poststr(request, "<html><head><title>BK7252 camera</title></head><body>");
-          +	poststr(request, "<h3>BK7252 camera</h3>");
-          +	poststr(request, "<img src=\"/camera.mjpg\" width=\"640\" "
-          +		"onerror=\"this.onerror=null;this.src='/camera.jpg?'+Date.now();\">");
-          +	poststr(request, "<p><a href=\"/camera.jpg\">single frame</a> | "
-          +		"<a href=\"/\">index</a></p>");
-          +	poststr(request, "</body></html>");
-          +	poststr(request, NULL);
-          +	return 0;
-          +}
-          +
-          +void Camera_BK7252_Init(void)
-          +{
-          +	CMD_RegisterCommand("camera_detect", CMD_Camera_Detect, NULL);
-          +	CMD_RegisterCommand("camera_on", CMD_Camera_On, NULL);
-          +	CMD_RegisterCommand("camera_off", CMD_Camera_Off, NULL);
-          +	CMD_RegisterCommand("camera_info", CMD_Camera_Info, NULL);
-          +	CMD_RegisterCommand("camera_reg", CMD_Camera_Reg, NULL);
-          +
-          +	HTTP_RegisterCallback("/camera.jpg", HTTP_GET, http_camera_jpg, 0);
-          +	HTTP_RegisterCallback("/camera.mjpg", HTTP_GET, http_camera_mjpg, 0);
-          +	HTTP_RegisterCallback("/camview", HTTP_GET, http_camera_view, 0);
-          +
-          +	ADDLOG_INFO(LOG_FEATURE_CMD, "Camera: BK7252 cam5-i2cdiag driver registered (camera_detect /camera.jpg /camview)");
-          +}
-          +
-          +#endif // ENABLE_DRIVER_CAMERA_BK7252
-
-          PATCH_EOF
+          cat > /tmp/patch.gz.b64 <<'B64_EOF'
+          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
+          B64_EOF
+          base64 -di /tmp/patch.gz.b64 | gunzip > bk7252_118321_cam.patch
+          echo "05b4f19de8ef8af1e928e8e3ac4c68ffdda3dc2591226652029f08cb4f81470a  bk7252_118321_cam.patch" | sha256sum -c -
           wc -c bk7252_118321_cam.patch
 
       - name: Apply patch and verify key lines
@@ -736,7 +213,7 @@ jobs:
           grep -q "DENABLE_LITTLEFS=1" platforms/BK723x/OpenBeken.mk
           grep -q "PLATFORM_BK7252" src/littlefs/our_lfs.h
           grep -q "ENABLE_DRIVER_CAMERA_BK7252" platforms/BK723x/OpenBeken.mk
-          grep -q "camera_intfer_init" sdk/beken_freertos_sdk/beken378/beken_src.mk
+          grep -q "camera_intfer_init" sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.c
           grep -q "gc0329v_init_talbe" sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.h
           grep -q "GC0329V_DEV_ID" sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.c
           grep -q "i2c1_isr_count" sdk/beken_freertos_sdk/beken378/driver/i2c/i2c1.c
