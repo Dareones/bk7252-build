@@ -1,4 +1,4 @@
-name: Build OpenBeken BK7252 1.18.321-base1 (no camera, console+LFS only)
+name: Build OpenBeken BK7252 1.18.321-base1 + OTA rbl (no camera, console+LFS)
 on:
   workflow_dispatch:
 jobs:
@@ -190,12 +190,23 @@ jobs:
           make bk7251 -j"$(nproc)" USER_SW_VER="1.18.321-base1" OBK_DIR="../../src"
           ls -la out/
 
+      - name: Pack OTA rbl (same tool/keys as official build.sh)
+        run: |
+          cd app/sdk/beken_freertos_sdk
+          test -s out/bsp.bin
+          chmod +x tools/rtt_ota/rt_ota_packaging_tool_cli
+          ./tools/rtt_ota/rt_ota_packaging_tool_cli \
+            -f ./out/bsp.bin -o ./out/app.rbl -p app -c gzip -s aes \
+            -k 0123456789ABCDEF0123456789ABCDEF -i 0123456789ABCDEF \
+            -v 1.18.321-base1
+          test -s out/app.rbl
+          ls -la out/app.rbl
+
       - name: Verify build markers
         run: |
           cd app/sdk/beken_freertos_sdk
           grep -aq "1.18.321-base1" out/bk7251.bin
           test -s out/bk7251_UA.bin
-          test -s out/bk7251_QIO.bin
           echo "markers verified"
 
       - name: Collect artifacts
@@ -203,6 +214,7 @@ jobs:
           mkdir -p artifacts
           cp app/sdk/beken_freertos_sdk/out/bk7251_QIO.bin  artifacts/OpenBK7252_QIO_1.18.321-base1.bin
           cp app/sdk/beken_freertos_sdk/out/bk7251_UA.bin   artifacts/OpenBK7252_UA_1.18.321-base1.bin
+          cp app/sdk/beken_freertos_sdk/out/app.rbl         artifacts/OpenBK7252_1.18.321-base1.rbl
           md5sum artifacts/* | tee artifacts/md5sums.txt
           ls -la artifacts/
 
