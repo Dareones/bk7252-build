@@ -1,0 +1,94 @@
+name: Build OpenBeken BK7252 1.18.321-cam13 (OTA rbl, P14 camera rail)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+
+      - name: Download pinned sources (OpenBeken 1.18.321 + SDK f5a64d4 + berry b9ce913)
+        run: |
+          mkdir -p app
+          curl -fsSL -o /tmp/app.tar.gz https://github.com/openshwprojects/OpenBK7231T_App/archive/refs/tags/1.18.321.tar.gz
+          echo "07fe1498dd5188899b0323fee850d4cabac498b307b26d92862f9d7fdec8ad63  /tmp/app.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/app.tar.gz -C app --strip-components=1
+          rm -rf app/sdk/beken_freertos_sdk app/libraries/berry
+          mkdir -p app/sdk/beken_freertos_sdk app/libraries/berry
+          curl -fsSL -o /tmp/sdk.tar.gz https://github.com/NonPIayerCharacter/beken_freertos_sdk/archive/f5a64d4cda03bac6d885f4f30c27bbd3435c5e3a.tar.gz
+          tar -xzf /tmp/sdk.tar.gz -C app/sdk/beken_freertos_sdk --strip-components=1
+          curl -fsSL -o /tmp/berry.tar.gz https://github.com/berry-lang/berry/archive/b9ce913d9d43bb296d9604bc0cb4f2f68a6b703f.tar.gz
+          tar -xzf /tmp/berry.tar.gz -C app/libraries/berry --strip-components=1
+          echo "sources ready"
+
+      - name: Apply camera patch from repo and verify
+        run: |
+          cd app
+          git apply --verbose ../patches/bk7252_118321_cam13.patch
+          grep -q "DENABLE_LITTLEFS=1" platforms/BK723x/OpenBeken.mk
+          grep -q "PLATFORM_BK7252" src/littlefs/our_lfs.h
+          grep -q "ENABLE_DRIVER_CAMERA_BK7252" platforms/BK723x/OpenBeken.mk
+          grep -q "camera_intfer_init" sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.c
+          grep -q "GC0329V_DEV_ID" sdk/beken_freertos_sdk/beken378/func/camera_intf/camera_intf.c
+          grep -q "cam13-p14power" src/driver/drv_camera_bk7252.c
+          grep -q "cam_pwr_pin = 14" src/driver/drv_camera_bk7252.c
+          echo "patch applied and verified"
+
+      - name: Berry prebuild (generate string tables)
+        run: |
+          cd app
+          mkdir -p libraries/berry/generate
+          python3 libraries/berry/tools/coc/coc -o libraries/berry/generate libraries/berry/src src/berry/modules -c include/berry_conf.h
+
+      - name: Extract bundled ARM toolchain
+        run: |
+          mkdir -p "$RUNNER_TEMP/tc"
+          tar -xJf app/sdk/beken_freertos_sdk/toolchain/arm-none-eabi-gcc.tar.xz -C "$RUNNER_TEMP/tc"
+          GCC_PATH="$(dirname "$(find "$RUNNER_TEMP/tc" -name arm-none-eabi-gcc | head -1)")"
+          echo "GCC_PATH=$GCC_PATH" >> "$GITHUB_ENV"
+          "$GCC_PATH/arm-none-eabi-gcc" --version | head -1
+
+      - name: Build bk7251
+        run: |
+          export ARM_GCC_TOOLCHAIN="$GCC_PATH/"
+          export PATH="$GCC_PATH:$PATH"
+          cd app/sdk/beken_freertos_sdk
+          make bk7251 -j"$(nproc)" USER_SW_VER="1.18.321-cam13" OBK_DIR="../../src"
+          ls -la out/
+
+      - name: Verify build markers
+        run: |
+          cd app/sdk/beken_freertos_sdk
+          B=out/bk7251.bin
+          grep -aq "cam13-p14power" "$B"
+          grep -aq "CAM13 power P" "$B"
+          grep -aq "GC0329V init finish" "$B"
+          grep -aq "1.18.321-cam13" "$B"
+          test -s out/bk7251_UA.bin
+          echo "markers verified"
+
+      - name: Pack OTA rbl (gzip, partition 'app', fits 0x132000-0x1E0000)
+        run: |
+          cd app/sdk/beken_freertos_sdk/tools/rtt_ota
+          ./rt_ota_packaging_tool_cli -f ../../out/bk7251_UA.bin -v 1.18.321-cam13 -p app -c gzip -o ../../out/OpenBK7252_ota_1.18.321-cam13.rbl
+          ls -la ../../out/*.rbl
+
+      - name: Collect artifacts
+        run: |
+          cd app/sdk/beken_freertos_sdk
+          mkdir -p artifacts
+          cp out/bk7251_QIO.bin  artifacts/OpenBK7252_QIO_1.18.321-cam13.bin
+          cp out/bk7251_UA.bin   artifacts/OpenBK7252_UA_1.18.321-cam13.bin
+          cp out/OpenBK7252_ota_1.18.321-cam13.rbl artifacts/
+          md5sum artifacts/* | tee artifacts/md5sums_1.18.321-cam13.txt
+          ls -la artifacts/
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenBK7252_1.18.321-cam13
+          path: app/sdk/beken_freertos_sdk/artifacts/
